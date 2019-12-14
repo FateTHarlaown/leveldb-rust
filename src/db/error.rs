@@ -21,6 +21,9 @@ pub enum StatusError {
 
     #[fail(display = "{}", _0)]
     IOError(io::Error),
+
+    #[fail(display = "{}", _0)]
+    Eof(String),
 }
 
 impl From<io::Error> for StatusError {

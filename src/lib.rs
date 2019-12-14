@@ -1,16 +1,19 @@
 #![feature(core_intrinsics)]
 
-pub mod log;
+pub mod db;
 pub mod util;
 
 #[cfg(test)]
 mod tests {
-    use crate::log::RecordType;
-    use std::mem::size_of;
+    use crate::db::RecordType;
+
+    fn number_string(n: i32) -> String {
+        format!("{}", n)
+    }
 
     #[test]
     fn it_works() {
-        assert_eq!(size_of::<RecordType>(), 4);
-        assert_eq!(2 + 2, 4);
+        let a = RecordType::FullType as u8;
+        assert_eq!(a, 1 as u8);
     }
 }
