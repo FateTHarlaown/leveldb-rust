@@ -1,9 +1,9 @@
-use crc32fast::Hasher;
-use crate::db::slice::Slice;
-use crate::db::{RecordType, WritableFile, SequentialFile, BLOCK_SIZE, HEADER_SIZE};
-use crate::util::buffer::{BufferReader};
 use crate::db::error::{Result, StatusError};
-use byteorder::{LittleEndian, WriteBytesExt, ReadBytesExt};
+use crate::db::slice::Slice;
+use crate::db::{RecordType, SequentialFile, WritableFile, BLOCK_SIZE, HEADER_SIZE};
+use crate::util::buffer::BufferReader;
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use crc32fast::Hasher;
 
 pub struct LogWriter<W: WritableFile> {
     writer: W,
@@ -12,21 +12,15 @@ pub struct LogWriter<W: WritableFile> {
 
 impl<W: WritableFile> LogWriter<W> {
     pub fn new(writer: W) -> Self {
-        LogWriter {
-            writer,
-            offset: 0,
-        }
+        LogWriter { writer, offset: 0 }
     }
 
     pub fn new_with_dest_len(writer: W, offset: usize) -> Self {
-        LogWriter {
-            writer,
-            offset,
-        }
+        LogWriter { writer, offset }
     }
 
     pub fn add_record(&mut self, mut slice: &Slice) -> Result<()> {
-        let mut  begin = true;
+        let mut begin = true;
         loop {
             if slice.is_empty() {
                 break;
@@ -37,7 +31,8 @@ impl<W: WritableFile> LogWriter<W> {
             assert!(leftover >= 0);
             if leftover < HEADER_SIZE {
                 if leftover > 0 {
-                    self.writer.append(b"\x00\x00\x00\x00\x00\x00\x00"[..leftover].as_ref())?;
+                    self.writer
+                        .append(b"\x00\x00\x00\x00\x00\x00\x00"[..leftover].as_ref())?;
                 }
                 self.offset = 0;
             }
@@ -131,7 +126,6 @@ impl<R: SequentialFile> LogReader<R> {
                     } else {
                         return Ok(());
                     }
-
                 }
                 RecordType::Eof => {
                     if in_fragment_record {
@@ -193,12 +187,12 @@ impl<R: SequentialFile> LogReader<R> {
                 if !self.eof {
                     return Ok(RecordType::BadRecord);
                 }
-                return Ok(RecordType::Eof)
+                return Ok(RecordType::Eof);
             }
             if record_type == RecordType::ZeroType as u8 && length == 0 {
                 self.consumed = 0;
                 self.cap = 0;
-                return Ok(RecordType::BadRecord)
+                return Ok(RecordType::BadRecord);
             }
 
             let data = buf.read_bytes(length as usize)?;
@@ -209,12 +203,12 @@ impl<R: SequentialFile> LogReader<R> {
                 // TODO report coruption
                 self.consumed = 0;
                 self.cap = 0;
-                return Ok(RecordType::BadRecord)
+                return Ok(RecordType::BadRecord);
             }
 
             self.consumed += HEADER_SIZE + length as usize;
             record.extend_from_slice(data);
-            return Ok(record_type.into())
+            return Ok(record_type.into());
         }
     }
 }
@@ -222,12 +216,12 @@ impl<R: SequentialFile> LogReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::rc::Rc;
-    use std::cell::RefCell;
     use crate::db::SequentialFile;
-    use std::io::{Write, Read};
-    use failure::Fail;
     use crate::util::buffer::BufferWriter;
+    use failure::Fail;
+    use std::cell::RefCell;
+    use std::io::{Read, Write};
+    use std::rc::Rc;
 
     struct MockWritAbleFile {
         vec: Rc<RefCell<Vec<u8>>>,
@@ -235,9 +229,7 @@ mod tests {
 
     impl MockWritAbleFile {
         pub fn new(vec: Rc<RefCell<Vec<u8>>>) -> Self {
-            MockWritAbleFile {
-                vec,
-            }
+            MockWritAbleFile { vec }
         }
     }
 
@@ -247,9 +239,15 @@ mod tests {
             Ok(())
         }
 
-        fn close(&mut self) -> Result<()> {return Ok(())}
-        fn flush(&mut self) -> Result<()> {return Ok(())}
-        fn sync(&mut self) -> Result<()> {return Ok(())}
+        fn close(&mut self) -> Result<()> {
+            return Ok(());
+        }
+        fn flush(&mut self) -> Result<()> {
+            return Ok(());
+        }
+        fn sync(&mut self) -> Result<()> {
+            return Ok(());
+        }
     }
 
     struct MockDataSource {
@@ -339,11 +337,20 @@ mod tests {
             assert!(tester.write(input.as_bytes()).is_ok())
         }
         for expect in cases.iter() {
-            assert_eq!(String::from_utf8(tester.read().unwrap()).unwrap().as_str(), expect.as_str());
+            assert_eq!(
+                String::from_utf8(tester.read().unwrap()).unwrap().as_str(),
+                expect.as_str()
+            );
         }
 
-        assert_eq!(tester.read().unwrap_err().to_string(), format!("meet a eof"));
-        assert_eq!(tester.read().unwrap_err().to_string(), format!("meet a eof"));
+        assert_eq!(
+            tester.read().unwrap_err().to_string(),
+            format!("meet a eof")
+        );
+        assert_eq!(
+            tester.read().unwrap_err().to_string(),
+            format!("meet a eof")
+        );
     }
 
     #[test]
@@ -353,9 +360,15 @@ mod tests {
             assert!(tester.write(number_string(i).as_bytes()).is_ok())
         }
         for i in 0..1000000 {
-            assert_eq!(String::from_utf8(tester.read().unwrap()).unwrap(), number_string(i));
+            assert_eq!(
+                String::from_utf8(tester.read().unwrap()).unwrap(),
+                number_string(i)
+            );
         }
 
-        assert_eq!(tester.read().unwrap_err().to_string(), format!("meet a eof"));
+        assert_eq!(
+            tester.read().unwrap_err().to_string(),
+            format!("meet a eof")
+        );
     }
 }
