@@ -1,4 +1,4 @@
-use crate::db::error::Result;
+use crate::db::error::{Result, StatusError};
 use crate::db::slice::Slice;
 
 pub mod error;
@@ -15,6 +15,7 @@ pub enum RecordType {
     LastType = 4,
     Eof = 5,
     BadRecord = 6,
+    UnKnown = 7,
 }
 
 pub const BLOCK_SIZE: usize = 32768;
@@ -31,7 +32,8 @@ impl From<u8> for RecordType {
             3 => RecordType::MiddleType,
             4 => RecordType::LastType,
             5 => RecordType::Eof,
-            _ => RecordType::BadRecord,
+            6 => RecordType::BadRecord,
+            _ => RecordType::UnKnown,
         }
     }
 }
@@ -46,4 +48,8 @@ pub trait WritableFile {
 pub trait SequentialFile {
     fn read(&mut self, buf: &mut [u8], n: usize) -> Result<usize>;
     fn skip(&mut self, n: usize) -> Result<()>;
+}
+
+pub trait Reporter {
+    fn corruption(&mut self, n: usize, status: StatusError);
 }
