@@ -3,6 +3,7 @@ use crate::db::slice::Slice;
 
 pub mod error;
 pub mod log;
+pub mod skiplist;
 pub mod slice;
 
 // define record type in block
