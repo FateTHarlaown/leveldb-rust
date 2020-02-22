@@ -1,5 +1,5 @@
 # leveldb-rust
 
-[![Build Status](https://www.travis-ci.org/FateTHarlaown/leveldb-rust.svg?branch=master)](https://www.travis-ci.org/FateTHarlaown/leveldb-rust)
+![](https://www.travis-ci.org/FateTHarlaown/leveldb-rust.svg?branch=master)
 
 leveldb implemented by rust
