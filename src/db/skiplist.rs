@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::{thread_rng, Rng};
 use std::mem::{self, size_of};
 use std::ptr;
 use std::rc::Rc;
@@ -7,13 +7,12 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crate::util::arena::Arena;
 use crate::util::cmp::Comparator;
-use rand::rngs::ThreadRng;
 use std::cell::RefCell;
 use std::cmp;
 
 // max height for skip list
 const MAX_HEIGHT: usize = 12;
-
+// Increase height with probability 1 in kBranching
 const BRANCHING: usize = 4;
 
 #[repr(C)]
@@ -161,23 +160,20 @@ pub struct SkipList<K> {
     comparator: Rc<dyn Comparator<K>>,
     arena: Rc<RefCell<Arena>>,
     max_height: AtomicUsize,
-    rand: ThreadRng,
 }
 
 impl<K> SkipList<K> {
     pub fn new(comparator: Rc<dyn Comparator<K>>, arena: Rc<RefCell<Arena>>, root: K) -> Self {
         let head = Node::new_node_ptr(root, MAX_HEIGHT, arena.clone());
-        let rand = rand::thread_rng();
         SkipList {
             head,
             comparator,
             arena,
             max_height: AtomicUsize::new(1),
-            rand,
         }
     }
 
-    pub fn insert(&mut self, key: K) {
+    pub fn insert(&self, key: K) {
         let mut prev = Vec::with_capacity(MAX_HEIGHT);
         prev.resize(MAX_HEIGHT, ptr::null_mut());
         let x = self.find_greater_or_equal(&key, Some(&mut prev));
@@ -249,10 +245,10 @@ impl<K> SkipList<K> {
         self.max_height.load(Ordering::Relaxed)
     }
 
-    fn random_height(&mut self) -> usize {
+    fn random_height(&self) -> usize {
         let mut height: usize = 1;
         loop {
-            if self.rand.gen_range(0, BRANCHING) == 0 && height < MAX_HEIGHT {
+            if thread_rng().gen_range(0, BRANCHING) == 0 && height < MAX_HEIGHT {
                 height += 1;
                 continue;
             } else {
@@ -310,8 +306,14 @@ impl<K> SkipList<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::thread_rng;
+    use rand::rngs::ThreadRng;
+    use rand::RngCore;
+    use std::collections::hash_map::DefaultHasher;
     use std::collections::BTreeSet;
+    use std::hash::Hasher;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::thread;
 
     type Key = u64;
 
@@ -374,7 +376,7 @@ mod tests {
         let (n, r) = (2000 as u64, 5000 as u64);
         let mut rnd = thread_rng();
         let mut keys = BTreeSet::new();
-        let mut list = new_list();
+        let list = new_list();
         for _ in 0..n {
             let key = rnd.gen_range(0, r);
             if keys.insert(key) {
@@ -434,6 +436,265 @@ mod tests {
                 iter.prev();
             }
             assert!(!iter.valid());
+        }
+    }
+
+    // We want to make sure that with a single writer and multiple
+    // concurrent readers (with no synchronization other than when a
+    // reader's iterator is created), the reader always observes all the
+    // data that was present in the skip list when the iterator was
+    // constructed.  Because insertions are happening concurrently, we may
+    // also observe new values that were inserted since the iterator was
+    // constructed, but we should never miss any values that were present
+    // at iterator construction time.
+    //
+    // We generate multi-part keys:
+    //     <key,gen,hash>
+    // where:
+    //     key is in range [0..K-1]
+    //     gen is a generation number for key
+    //     hash is hash(key,gen)
+    //
+    // The insertion code picks a random key, sets gen to be 1 + the last
+    // generation number inserted for that key, and sets hash to Hash(key,gen).
+    //
+    // At the beginning of a read, we snapshot the last inserted
+    // generation number for each key.  We then iterate, including random
+    // calls to Next() and Seek().  For every key we encounter, we
+    // check that it is either expected given the initial snapshot or has
+    // been concurrently added since the iterator started.
+    const K: u64 = 4;
+
+    struct State {
+        generation: Vec<AtomicU64>,
+    }
+
+    impl State {
+        pub fn new() -> Self {
+            let mut generation = Vec::new();
+            for _ in 0..K {
+                generation.push(AtomicU64::new(0));
+            }
+
+            State { generation }
+        }
+
+        pub fn get(&self, k: u64) -> u64 {
+            self.generation
+                .get(k as usize)
+                .unwrap()
+                .load(Ordering::Acquire)
+        }
+
+        pub fn set(&self, k: u64, v: u64) {
+            self.generation
+                .get(k as usize)
+                .unwrap()
+                .store(v, Ordering::Release)
+        }
+    }
+
+    struct ConcurrentTest {
+        current: State,
+        list: SkipList<Key>,
+    }
+
+    unsafe impl Sync for ConcurrentTest {}
+    unsafe impl Send for ConcurrentTest {}
+
+    impl ConcurrentTest {
+        pub fn new() -> Self {
+            let arena = Rc::new(RefCell::new(Arena::new()));
+            let comparator = Rc::new(U64Comparator {});
+            let list = SkipList::new(comparator, arena, 0);
+            let current = State::new();
+            ConcurrentTest { current, list }
+        }
+
+        pub fn key(key: Key) -> u64 {
+            key >> 40
+        }
+
+        pub fn gen(key: Key) -> u64 {
+            ((key) >> 8) & 0xffffffff
+        }
+
+        pub fn hash(key: Key) -> u64 {
+            key & 0xff
+        }
+
+        pub fn hash_numbers(k: u64, g: u64) -> u64 {
+            let mut hash = DefaultHasher::new();
+            hash.write_u64(k);
+            hash.write_u64(g);
+            hash.finish()
+        }
+
+        pub fn make_key(k: u64, g: u64) -> Key {
+            assert!(k <= K);
+            assert!(g <= 0xffffffff);
+            ((k << 40) | (g << 8) | (ConcurrentTest::hash_numbers(k, g) & 0xff))
+        }
+
+        pub fn is_valid_key(k: Key) -> bool {
+            let key = ConcurrentTest::key(k);
+            let gen = ConcurrentTest::gen(k);
+            ConcurrentTest::hash(k) == ConcurrentTest::hash_numbers(key, gen) & 0xff
+        }
+
+        pub fn random_target(rnd: &mut ThreadRng) -> Key {
+            match rnd.next_u64() % 10 {
+                0 => ConcurrentTest::make_key(0, 0),
+                1 => ConcurrentTest::make_key(K, 0),
+                _ => ConcurrentTest::make_key(rnd.next_u64() % K, 0),
+            }
+        }
+
+        // REQUIRES: External synchronization
+        pub fn write_step(&self, rnd: &mut ThreadRng) {
+            let k = rnd.next_u64() % K;
+            let g = self.current.get(k) + 1;
+            let key = ConcurrentTest::make_key(k, g);
+            self.list.insert(key);
+            self.current.set(k, g);
+        }
+
+        pub fn read_step(&self, rnd: &mut ThreadRng) {
+            let initial_state = State::new();
+            for i in 0..K {
+                initial_state.set(i, self.current.get(i));
+            }
+
+            let mut pos = ConcurrentTest::random_target(rnd);
+            let mut iter = SkipListIterator::new(&self.list);
+            iter.seek(&pos);
+            loop {
+                let current = if iter.valid() {
+                    let key = *iter.key();
+                    assert!(ConcurrentTest::is_valid_key(key));
+                    key
+                } else {
+                    ConcurrentTest::make_key(K, 0)
+                };
+                assert!(pos <= current);
+
+                // Verify that everything in [pos,current) was not present in
+                // initial_state.
+                while pos < current {
+                    let k = ConcurrentTest::key(pos);
+                    let g = ConcurrentTest::gen(pos);
+                    assert!(k < K);
+                    assert!(g == 0 || g > initial_state.get(k));
+
+                    pos = if k < ConcurrentTest::key(current) {
+                        ConcurrentTest::make_key(k + 1, 0)
+                    } else {
+                        ConcurrentTest::make_key(k, g + 1)
+                    }
+                }
+
+                if !iter.valid() {
+                    break;
+                }
+
+                if rnd.next_u64() % 2 > 0 {
+                    iter.next();
+                    let k = ConcurrentTest::key(pos);
+                    let g = ConcurrentTest::gen(pos);
+                    pos = ConcurrentTest::make_key(k, g + 1);
+                } else {
+                    let new_target = ConcurrentTest::random_target(rnd);
+                    if new_target > pos {
+                        pos = new_target;
+                        iter.seek(&new_target);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_concurrent_without_threads() {
+        let test = ConcurrentTest::new();
+        let mut rnd = thread_rng();
+        for _ in 0..1000 {
+            test.read_step(&mut rnd);
+            test.write_step(&mut rnd)
+        }
+    }
+
+    #[derive(PartialEq, Eq, Copy, Clone)]
+    enum ReaderState {
+        Starting,
+        Running,
+        Done,
+    }
+
+    struct TestState {
+        pub test: ConcurrentTest,
+        pub quit_flag: AtomicBool,
+        state: (Mutex<ReaderState>, Condvar),
+    }
+
+    impl TestState {
+        pub fn new() -> Self {
+            let test = ConcurrentTest::new();
+            let quit_flag = AtomicBool::new(false);
+            let state = (Mutex::new(ReaderState::Starting), Condvar::new());
+
+            TestState {
+                test,
+                quit_flag,
+                state,
+            }
+        }
+
+        pub fn wait(&self, s: ReaderState) {
+            let (mu, cond) = &self.state;
+            let mut guard = mu.lock().unwrap();
+            while *guard != s {
+                guard = cond.wait(guard).unwrap();
+            }
+        }
+
+        pub fn change(&self, s: ReaderState) {
+            let (mu, cond) = &self.state;
+            let mut guard = mu.lock().unwrap();
+            *guard = s;
+            cond.notify_one();
+        }
+    }
+
+    #[test]
+    fn test_run_concurrent() {
+        let n = 1000;
+        let size = 1000;
+        let mut handles = Vec::new();
+        for _ in 0..n {
+            let state_read = Arc::new(TestState::new());
+            let state_write = Arc::clone(&state_read);
+            let handle = thread::spawn(move || {
+                let mut rnd = thread_rng();
+
+                state_read.change(ReaderState::Running);
+                while !state_read.quit_flag.load(Ordering::Acquire) {
+                    state_read.test.read_step(&mut rnd);
+                }
+                state_read.change(ReaderState::Done)
+            });
+            handles.push(handle);
+
+            let mut rnd = thread_rng();
+            state_write.wait(ReaderState::Running);
+            for _ in 0..size {
+                state_write.test.write_step(&mut rnd);
+            }
+            state_write.quit_flag.store(true, Ordering::Release);
+            state_write.wait(ReaderState::Done);
+        }
+
+        for h in handles {
+            h.join().unwrap();
         }
     }
 }
