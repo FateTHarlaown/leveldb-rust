@@ -174,8 +174,7 @@ impl<K> SkipList<K> {
     }
 
     pub fn insert(&self, key: K) {
-        let mut prev = Vec::with_capacity(MAX_HEIGHT);
-        prev.resize(MAX_HEIGHT, ptr::null_mut());
+        let mut prev = [ptr::null_mut(); MAX_HEIGHT];
         let x = self.find_greater_or_equal(&key, Some(&mut prev));
 
         assert!(x.is_null() || !self.equal(&key, unsafe { &(*x).key }));
@@ -262,7 +261,7 @@ impl<K> SkipList<K> {
     fn find_greater_or_equal(
         &self,
         key: &K,
-        mut prev: Option<&mut Vec<*mut Node<K>>>,
+        mut prev: Option<&mut [*mut Node<K>]>,
     ) -> *mut Node<K> {
         let mut x = self.head;
         let mut level = self.get_max_height() - 1;
