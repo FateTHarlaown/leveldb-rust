@@ -328,6 +328,10 @@ mod tests {
                 cmp::Ordering::Greater
             }
         }
+
+        fn name(&self) -> &'static str {
+            "skiplist test comparator"
+        }
     }
 
     fn new_list() -> SkipList<Key> {

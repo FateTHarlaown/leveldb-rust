@@ -1,6 +1,4 @@
 use crate::db::error::{Result, StatusError};
-use crate::db::slice::Slice;
-use crate::util::buffer::BufferWriter;
 use byteorder::{ReadBytesExt, WriteBytesExt};
 
 const B: u32 = 128;
@@ -44,7 +42,7 @@ pub trait DecodeVarint {
     fn decode_varint64(&mut self) -> Result<u64>;
 }
 
-impl EncodeVarint for &mut Slice {
+impl EncodeVarint for &mut [u8] {
     fn encode_varint32(&mut self, v: u32) -> Result<()> {
         if v < (1 << 7) {
             self.write_u8(v as u8)?;
@@ -81,7 +79,7 @@ impl EncodeVarint for &mut Slice {
     }
 }
 
-impl DecodeVarint for &Slice {
+impl DecodeVarint for &[u8] {
     fn decode_varint32(&mut self) -> Result<u32> {
         let mut shift = 0;
         let mut result = 0;

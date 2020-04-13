@@ -1,71 +1,65 @@
-use crate::db::error::Result;
-use crate::util::buffer::{BufferReader, BufferWriter};
+use std::ptr;
+use std::slice;
 
-use std::intrinsics::unlikely;
-use std::io;
+#[derive(Copy, Clone)]
+pub struct Slice {
+    data: *const u8,
+    size: usize,
+}
 
-pub type Slice = [u8];
-
-impl<'a> BufferReader for &'a [u8] {
-    #[inline]
-    fn bytes(&self) -> &[u8] {
-        self
+impl Slice {
+    pub fn new(data: *const u8, size: usize) -> Self {
+        Slice { data, size }
     }
 
     #[inline]
-    fn advance(&mut self, count: usize) {
-        *self = &self[count..]
+    pub fn data(&self) -> *const u8 {
+        self.data
     }
 
-    fn read_bytes(&mut self, count: usize) -> Result<&[u8]> {
-        if unsafe { unlikely(self.len() < count) } {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Unexpected EOF").into());
+    #[inline]
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    #[inline]
+    pub fn remove_prefix(&mut self, n: usize) {
+        if n >= self.size {
+            panic!("the slice out bounds ")
+        } else {
+            unsafe {
+                self.data = self.data.add(n);
+            }
+            self.size -= n;
         }
-        let (left, right) = self.split_at(count);
-        *self = right;
-        Ok(left)
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_null() || self.size == 0
     }
 }
 
-impl<'a, T: BufferReader + ?Sized> BufferReader for &'a mut T {
-    #[inline]
-    fn bytes(&self) -> &[u8] {
-        (**self).bytes()
-    }
-
-    #[inline]
-    fn advance(&mut self, count: usize) {
-        (**self).advance(count)
-    }
-
-    #[inline]
-    fn read_bytes(&mut self, count: usize) -> Result<&[u8]> {
-        (**self).read_bytes(count)
+impl<'a> From<&'a [u8]> for Slice {
+    fn from(v: &'a [u8]) -> Self {
+        Slice::new(v.as_ptr(), v.len())
     }
 }
 
-impl<'a> BufferWriter for &'a mut [u8] {
-    #[inline]
-    unsafe fn bytes_mut(&mut self, _size: usize) -> &mut [u8] {
-        self
-    }
-
-    #[inline]
-    unsafe fn advance_mut(&mut self, count: usize) {
-        let original_self = std::mem::replace(self, &mut []);
-        *self = &mut original_self[count..];
-    }
-
-    fn write_bytes(&mut self, values: &[u8]) -> Result<()> {
-        let write_len = values.len();
-        if unsafe { unlikely(self.len() < write_len) } {
-            return Err(
-                io::Error::new(io::ErrorKind::UnexpectedEof, "buffer not long enough").into(),
-            );
+impl Default for Slice {
+    fn default() -> Self {
+        Slice {
+            data: ptr::null(),
+            size: 0,
         }
-        let original_self = std::mem::replace(self, &mut []);
-        original_self[..write_len].copy_from_slice(values);
-        *self = &mut original_self[write_len..];
-        Ok(())
+    }
+}
+
+impl AsRef<[u8]> for Slice {
+    fn as_ref(&self) -> &[u8] {
+        if self.data.is_null() {
+            panic!("try to convert a empty slice to &[u8]")
+        }
+        unsafe { slice::from_raw_parts(self.data, self.size) }
     }
 }

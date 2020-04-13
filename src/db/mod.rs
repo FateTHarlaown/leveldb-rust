@@ -1,8 +1,9 @@
 use crate::db::error::{Result, StatusError};
-use crate::db::slice::Slice;
 
+mod dbformat;
 pub mod error;
 pub mod log;
+mod memtable;
 pub mod skiplist;
 pub mod slice;
 
@@ -40,7 +41,7 @@ impl From<u8> for RecordType {
 }
 
 pub trait WritableFile {
-    fn append(&mut self, data: &Slice) -> Result<()>;
+    fn append(&mut self, data: &[u8]) -> Result<()>;
     fn close(&mut self) -> Result<()>;
     fn flush(&mut self) -> Result<()>;
     fn sync(&mut self) -> Result<()>;

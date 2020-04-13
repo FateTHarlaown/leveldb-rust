@@ -1,5 +1,4 @@
 use crate::db::error::{Result, StatusError};
-use crate::db::slice::Slice;
 use crate::db::{RecordType, Reporter, SequentialFile, WritableFile, BLOCK_SIZE, HEADER_SIZE};
 use crate::util::buffer::BufferReader;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -19,7 +18,7 @@ impl<W: WritableFile> LogWriter<W> {
         LogWriter { writer, offset }
     }
 
-    pub fn add_record(&mut self, mut slice: &Slice) -> Result<()> {
+    pub fn add_record(&mut self, mut slice: &[u8]) -> Result<()> {
         let mut begin = true;
         loop {
             if slice.is_empty() {
@@ -308,7 +307,7 @@ mod tests {
     type MockWritableFile = Rc<RefCell<MemoryFile>>;
 
     impl WritableFile for MockWritableFile {
-        fn append(&mut self, data: &Slice) -> Result<()> {
+        fn append(&mut self, data: &[u8]) -> Result<()> {
             let mut file = self.borrow_mut();
             file.vec.extend_from_slice(data);
             Ok(())
@@ -414,7 +413,7 @@ mod tests {
             }
         }
 
-        pub fn write(&mut self, data: &Slice) -> Result<()> {
+        pub fn write(&mut self, data: &[u8]) -> Result<()> {
             self.writer.add_record(data)
         }
 
