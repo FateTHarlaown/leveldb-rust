@@ -305,6 +305,7 @@ impl<K> SkipList<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::slice::Slice;
     use rand::rngs::ThreadRng;
     use rand::RngCore;
     use std::collections::hash_map::DefaultHasher;
@@ -332,6 +333,10 @@ mod tests {
         fn name(&self) -> &'static str {
             "skiplist test comparator"
         }
+
+        fn find_shortest_separator(&self, _start: &mut Vec<u8>, _limit: Slice) {}
+
+        fn find_short_successor(&self, key: &mut Vec<u8>) {}
     }
 
     fn new_list() -> SkipList<Key> {

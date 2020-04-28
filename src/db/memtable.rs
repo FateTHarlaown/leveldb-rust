@@ -65,10 +65,11 @@ impl MemTable {
         if iter.valid() {
             let mut seek_key_buf = iter.key().as_ref();
             let internal_key_len = seek_key_buf.decode_varint32().unwrap();
-            let mut internal_key = seek_key_buf
-                .read_bytes(internal_key_len as usize)
-                .unwrap();
-            let seek_user_key = internal_key.read_bytes(internal_key.len()-8).unwrap().into();
+            let mut internal_key = seek_key_buf.read_bytes(internal_key_len as usize).unwrap();
+            let seek_user_key = internal_key
+                .read_bytes(internal_key.len() - 8)
+                .unwrap()
+                .into();
             if Ordering::Equal == self.comparator.compare(&key.user_key(), &seek_user_key) {
                 let record_type = internal_key.read_u64::<LittleEndian>().unwrap() & 0xff;
                 if record_type == TYPE_VALUE {

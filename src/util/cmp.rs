@@ -1,6 +1,6 @@
 use crate::db::slice::Slice;
 use crate::util::bit::memcmp;
-use std::cmp::Ordering;
+use std::cmp::{min, Ordering};
 
 pub trait Comparator<T: ?Sized> {
     // Three-way comparison.  Returns value:
@@ -20,6 +20,19 @@ pub trait Comparator<T: ?Sized> {
     // Names starting with "leveldb." are reserved and should not be used
     // by any clients of this package.
     fn name(&self) -> &'static str;
+
+    // Advanced functions: these are used to reduce the space requirements
+    // for internal data structures like index blocks.
+
+    // If *start < limit, changes *start to a short string in [start,limit).
+    // Simple comparator implementations may return with *start unchanged,
+    // i.e., an implementation of this method that does nothing is correct.
+    fn find_shortest_separator(&self, start: &mut Vec<u8>, limit: Slice);
+
+    // Changes *key to a short string >= *key.
+    // Simple comparator implementations may return with *key unchanged,
+    // i.e., an implementation of this method that does nothing is correct.
+    fn find_short_successor(&self, key: &mut Vec<u8>);
 }
 
 pub struct BitWiseComparator {}
@@ -49,6 +62,42 @@ impl Comparator<Slice> for BitWiseComparator {
 
     fn name(&self) -> &'static str {
         "Leveldb.BitwiseComaparator"
+    }
+
+    fn find_shortest_separator(&self, start: &mut Vec<u8>, limit: Slice) {
+        let min_length = min(start.len(), limit.size());
+        let mut diff_index = 0;
+        while diff_index < min_length && limit.as_ref()[diff_index] == start[diff_index] {
+            diff_index += 1;
+        }
+
+        // Do not shorten if one is a prefix of the other
+        if diff_index < min_length {
+            let diff_byte = start[diff_index];
+            if diff_byte < 0xff && diff_byte + 1 < limit.as_ref()[diff_index] {
+                start[diff_index] += 1;
+                start.truncate(diff_index + 1);
+                assert_eq!(
+                    self.compare(&start.as_slice().into(), &limit),
+                    Ordering::Less
+                )
+            }
+        }
+    }
+
+    fn find_short_successor(&self, key: &mut Vec<u8>) {
+        // Find first character that can be incremented
+        let mut truncate_len = 0;
+        for (i, byte) in key.iter_mut().enumerate() {
+            if *byte != 0xff {
+                *byte = *byte + 1;
+                truncate_len = i + 1;
+                break;
+            }
+        }
+        if truncate_len != 0 {
+            key.truncate(truncate_len)
+        }
     }
 }
 

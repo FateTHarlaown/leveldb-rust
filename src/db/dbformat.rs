@@ -1,4 +1,5 @@
 use crate::db::slice::Slice;
+use crate::util::buffer::BufferReader;
 use crate::util::cmp::Comparator;
 use crate::util::coding::{varint_length, EncodeVarint};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -6,7 +7,6 @@ use std::cmp::Ordering;
 use std::io::Write;
 use std::mem;
 use std::rc::Rc;
-use crate::util::buffer::BufferReader;
 
 pub type SequenceNumber = u64;
 // We leave eight bits empty at the bottom so a type and sequence#
@@ -19,6 +19,7 @@ pub type ValueType = u64;
 // data structures.
 pub const TYPE_DELETION: u64 = 0x0;
 pub const TYPE_VALUE: u64 = 0x1;
+pub const VALUE_TYPE_FOR_SEEK: u64 = TYPE_VALUE;
 
 pub fn pack_sequence_and_type(seq: u64, t: ValueType) -> u64 {
     assert!(seq <= MAX_SEQUENCE_NUMBER);
@@ -46,7 +47,7 @@ pub fn parse_internal_key(internal_key: Slice, result: &mut ParsedInternalKey) -
     let n = internal_key.size();
     if n >= 8 {
         let mut buf = internal_key.as_ref();
-        let user_key = buf.read_bytes(buf.len()-8).unwrap().into();
+        let user_key = buf.read_bytes(buf.len() - 8).unwrap().into();
         let tag = buf.read_u64::<LittleEndian>().unwrap();
         let seq = tag >> 8;
         let val_type = tag & 0xff;
@@ -137,16 +138,14 @@ impl InternalKeyComparator {
     }
 }
 
-impl Comparator<InternalKey> for InternalKeyComparator {
-    fn compare(&self, left: &InternalKey, right: &InternalKey) -> Ordering {
+impl Comparator<Slice> for InternalKeyComparator {
+    fn compare(&self, left: &Slice, right: &Slice) -> Ordering {
         // Order by:
         //    increasing user key (according to user-supplied comparator)
         //    decreasing sequence number
         //    decreasing type (though sequence# should be enough to disambiguate)
-        let mut left_slice = left.encode();
-        let mut right_slice = right.encode();
         let (left_user_key, right_user_key) =
-            (extract_user_key(left_slice), extract_user_key(right_slice));
+            (extract_user_key(*left), extract_user_key(*right));
         match self
             .user_comparator
             .compare(&left_user_key, &right_user_key)
@@ -154,10 +153,10 @@ impl Comparator<InternalKey> for InternalKeyComparator {
             Ordering::Greater => Ordering::Greater,
             Ordering::Less => Ordering::Less,
             Ordering::Equal => {
-                left_slice.remove_prefix(left_slice.size() - 8);
-                let left_seq = left_slice.as_ref().read_u64::<LittleEndian>().unwrap();
-                right_slice.remove_prefix(right_slice.size() - 8);
-                let right_seq = right_slice.as_ref().read_u64::<LittleEndian>().unwrap();
+                let mut left_seq_field = left.as_ref()[left.size()-8..].as_ref();
+                let left_seq = left_seq_field.read_u64::<LittleEndian>().unwrap();
+                let mut right_seq_filed = right.as_ref()[right.size()-8..].as_ref();
+                let right_seq = right_seq_filed.read_u64::<LittleEndian>().unwrap();
                 if left_seq > right_seq {
                     Ordering::Less
                 } else if left_seq < right_seq {
@@ -171,6 +170,56 @@ impl Comparator<InternalKey> for InternalKeyComparator {
 
     fn name(&self) -> &'static str {
         "leveldb.InternalKeyComparator"
+    }
+
+    fn find_shortest_separator(&self, start: &mut Vec<u8>, limit: Slice) {
+        let user_start = extract_user_key(start.as_slice().into());
+        let user_limit = extract_user_key(limit);
+        let mut tmp = Vec::from(user_start.as_ref());
+        self.user_comparator
+            .find_shortest_separator(&mut tmp, user_limit.into());
+        if tmp.len() < user_start.size()
+            && self
+                .user_comparator
+                .compare(&user_start, &tmp.as_slice().into())
+                == Ordering::Less
+        {
+            // User key has become shorter physically, but larger logically.
+            // Tack on the earliest possible number to the shortened user key.
+            tmp.write_u64::<LittleEndian>(pack_sequence_and_type(
+                MAX_SEQUENCE_NUMBER,
+                VALUE_TYPE_FOR_SEEK,
+            ))
+            .unwrap();
+            assert_eq!(
+                self.compare(&start.as_slice().into(), &tmp.as_slice().into()),
+                Ordering::Less,
+            );
+            assert_eq!(
+                self.compare(&tmp.as_slice().into(), &limit),
+                Ordering::Less,
+            );
+            mem::replace(start, tmp);
+        }
+    }
+
+    fn find_short_successor(&self, key: &mut Vec<u8>) {
+        let user_key = extract_user_key(key.as_slice().into());
+        let mut tmp = Vec::from(user_key.as_ref());
+        self.user_comparator.find_short_successor(&mut tmp);
+        if tmp.len() < user_key.size() {
+            // User key has become shorter physically, but larger logically.
+            // Tack on the earliest possible number to the shortened user key.
+            tmp.write_u64::<LittleEndian>(pack_sequence_and_type(
+                MAX_SEQUENCE_NUMBER,
+                VALUE_TYPE_FOR_SEEK,
+            )).unwrap();
+            assert_eq!(
+                self.compare(&key.as_slice().into(), &tmp.as_slice().into()),
+                Ordering::Less,
+            );
+            mem::replace(key, tmp);
+        }
     }
 }
 
@@ -212,7 +261,9 @@ impl LookupKey {
 
         writer_buf.encode_varint32(user_key_size as u32).unwrap();
         writer_buf.write_all(user_key.as_ref()).unwrap();
-        writer_buf.write_u64::<LittleEndian>(pack_sequence_and_type(s, TYPE_VALUE)).unwrap();
+        writer_buf
+            .write_u64::<LittleEndian>(pack_sequence_and_type(s, TYPE_VALUE))
+            .unwrap();
 
         LookupKey {
             user_key_start,
@@ -250,6 +301,7 @@ impl LookupKey {
 mod tests {
     use super::*;
     use crate::db::dbformat::SequenceNumber;
+    use crate::util::cmp::BitWiseComparator;
 
     fn i_key(user_key: Slice, seq: SequenceNumber, vt: ValueType) -> Vec<u8> {
         let mut key = Vec::new();
@@ -275,6 +327,20 @@ mod tests {
         assert!(!parse_internal_key(Slice::default(), &mut decoded));
     }
 
+    fn shorten(s: &Vec<u8>, l: &Vec<u8>) -> Vec<u8> {
+        let mut result = Vec::from(s.as_slice());
+        let comparator = InternalKeyComparator::new(Rc::new(BitWiseComparator {}));
+        comparator.find_shortest_separator(&mut result, l.as_slice().into());
+        result
+    }
+
+    fn short_successor(s: &Vec<u8>) -> Vec<u8> {
+        let mut result = Vec::from(s.as_slice());
+        let comparator = InternalKeyComparator::new(Rc::new(BitWiseComparator {}));
+        comparator.find_short_successor(&mut result);
+        result
+    }
+
     #[test]
     fn internal_key_encode_decode() {
         let keys = vec![
@@ -283,7 +349,7 @@ mod tests {
             "hello".as_bytes().into(),
             "longggggggggggggggggggggg".as_bytes().into(),
         ];
-        let  seqs = vec![
+        let seqs = vec![
             1,
             2,
             3,
@@ -310,5 +376,85 @@ mod tests {
     fn internal_key_decode_from_empty() {
         let mut internal_key = InternalKey::new_empty_key();
         assert!(!internal_key.decode_from("".as_bytes().into()))
+    }
+
+    #[test]
+    fn internal_key_short_separator() {
+        // When user keys are same
+        assert_eq!(
+            i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
+            shorten(
+                &i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
+                &i_key("foo".as_bytes().into(), 99, TYPE_VALUE)
+            )
+        );
+        assert_eq!(
+            i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
+            shorten(
+                &i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
+                &i_key("foo".as_bytes().into(), 101, TYPE_VALUE)
+            )
+        );
+        assert_eq!(
+            i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
+            shorten(
+                &i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
+                &i_key("foo".as_bytes().into(), 100, TYPE_VALUE)
+            )
+        );
+        assert_eq!(
+            i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
+            shorten(
+                &i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
+                &i_key("foo".as_bytes().into(), 100, TYPE_DELETION)
+            )
+        );
+
+        // When user keys are misordered
+        assert_eq!(
+            i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
+            shorten(
+                &i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
+                &i_key("bar".as_bytes().into(), 99, TYPE_VALUE)
+            )
+        );
+
+        // When user keys are different, but correctly ordered
+        assert_eq!(
+            i_key("g".as_bytes().into(), MAX_SEQUENCE_NUMBER, TYPE_VALUE),
+            shorten(
+                &i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
+                &i_key("hello".as_bytes().into(), 200, TYPE_VALUE)
+            )
+        );
+
+        // When start user key is prefix of limit user key
+        assert_eq!(
+            i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
+            shorten(
+                &i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
+                &i_key("foobar".as_bytes().into(), 200, TYPE_VALUE)
+            )
+        );
+
+        // When limit user key is prefix of start user key
+        assert_eq!(
+            i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
+            shorten(
+                &i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
+                &i_key("foobar".as_bytes().into(), 200, TYPE_VALUE)
+            )
+        );
+    }
+
+    #[test]
+    fn internal_key_shortest_successor() {
+        assert_eq!(
+            i_key("g".as_bytes().into(), MAX_SEQUENCE_NUMBER, TYPE_VALUE),
+            short_successor(
+                &i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
+            )
+        );
+
     }
 }
