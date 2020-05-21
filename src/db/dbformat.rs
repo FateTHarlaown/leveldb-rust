@@ -11,7 +11,7 @@ use std::rc::Rc;
 pub type SequenceNumber = u64;
 // We leave eight bits empty at the bottom so a type and sequence#
 // can be packed together into 64-bits.
-pub const MAX_SEQUENCE_NUMBER: u64 = ((0x1 << 56) - 1);
+pub const MAX_SEQUENCE_NUMBER: u64 = (0x1 << 56) - 1;
 
 pub type ValueType = u64;
 // Value types encoded as the last component of internal keys.
@@ -144,8 +144,7 @@ impl Comparator<Slice> for InternalKeyComparator {
         //    increasing user key (according to user-supplied comparator)
         //    decreasing sequence number
         //    decreasing type (though sequence# should be enough to disambiguate)
-        let (left_user_key, right_user_key) =
-            (extract_user_key(*left), extract_user_key(*right));
+        let (left_user_key, right_user_key) = (extract_user_key(*left), extract_user_key(*right));
         match self
             .user_comparator
             .compare(&left_user_key, &right_user_key)
@@ -153,9 +152,9 @@ impl Comparator<Slice> for InternalKeyComparator {
             Ordering::Greater => Ordering::Greater,
             Ordering::Less => Ordering::Less,
             Ordering::Equal => {
-                let mut left_seq_field = left.as_ref()[left.size()-8..].as_ref();
+                let mut left_seq_field = left.as_ref()[left.size() - 8..].as_ref();
                 let left_seq = left_seq_field.read_u64::<LittleEndian>().unwrap();
-                let mut right_seq_filed = right.as_ref()[right.size()-8..].as_ref();
+                let mut right_seq_filed = right.as_ref()[right.size() - 8..].as_ref();
                 let right_seq = right_seq_filed.read_u64::<LittleEndian>().unwrap();
                 if left_seq > right_seq {
                     Ordering::Less
@@ -195,10 +194,7 @@ impl Comparator<Slice> for InternalKeyComparator {
                 self.compare(&start.as_slice().into(), &tmp.as_slice().into()),
                 Ordering::Less,
             );
-            assert_eq!(
-                self.compare(&tmp.as_slice().into(), &limit),
-                Ordering::Less,
-            );
+            assert_eq!(self.compare(&tmp.as_slice().into(), &limit), Ordering::Less,);
             mem::replace(start, tmp);
         }
     }
@@ -213,7 +209,8 @@ impl Comparator<Slice> for InternalKeyComparator {
             tmp.write_u64::<LittleEndian>(pack_sequence_and_type(
                 MAX_SEQUENCE_NUMBER,
                 VALUE_TYPE_FOR_SEEK,
-            )).unwrap();
+            ))
+            .unwrap();
             assert_eq!(
                 self.compare(&key.as_slice().into(), &tmp.as_slice().into()),
                 Ordering::Less,
@@ -451,10 +448,7 @@ mod tests {
     fn internal_key_shortest_successor() {
         assert_eq!(
             i_key("g".as_bytes().into(), MAX_SEQUENCE_NUMBER, TYPE_VALUE),
-            short_successor(
-                &i_key("foo".as_bytes().into(), 100, TYPE_VALUE),
-            )
+            short_successor(&i_key("foo".as_bytes().into(), 100, TYPE_VALUE),)
         );
-
     }
 }
