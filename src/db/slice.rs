@@ -22,6 +22,11 @@ impl Slice {
         self.size
     }
 
+    pub fn at(&self, index: usize) -> u8 {
+        assert!(index < self.size);
+        unsafe { *self.data.add(index) }
+    }
+
     #[inline]
     pub fn remove_prefix(&mut self, n: usize) {
         if n >= self.size {

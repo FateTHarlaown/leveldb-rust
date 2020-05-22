@@ -1,12 +1,13 @@
 use crate::db::error::{Result, StatusError};
+use crate::db::option::Options;
 use crate::db::slice::Slice;
 use crate::db::Iterator;
 use crate::table::format::BlockContent;
 use crate::util::buffer::BufferReader;
 use crate::util::cmp::Comparator;
-use crate::util::coding::DecodeVarint;
-use byteorder::{LittleEndian, ReadBytesExt};
-use std::cmp::Ordering;
+use crate::util::coding::{put_varint32, DecodeVarint, EncodeVarint};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use std::cmp::{self, Ordering};
 use std::mem;
 use std::rc::Rc;
 
@@ -50,7 +51,7 @@ impl Block {
     }
 
     pub fn new_iterator(&self, comparator: Rc<dyn Comparator<Slice>>) -> BlockIter {
-       BlockIter::new(self, comparator)
+        BlockIter::new(self, comparator)
     }
 }
 
@@ -144,7 +145,7 @@ impl<'a> BlockIter<'a> {
             let offset = (self.current + step) as usize;
             let mut buf = self.block_data[offset..].as_ref();
             let non_share_key = buf.read_bytes(non_shared as usize).unwrap();
-            self.key.resize(shared as usize, 0);
+            self.key.truncate(shared as usize);
             self.key.extend_from_slice(non_share_key);
             self.value = buf.read_bytes(value_len as usize).unwrap().into();
             while self.restart_index + 1 < self.num_restarts
@@ -160,7 +161,8 @@ impl<'a> BlockIter<'a> {
     }
 
     fn corruption_error(&mut self) {
-        self.err.get_or_insert(StatusError::Corruption("bad entry in block".to_string()));
+        self.err
+            .get_or_insert(StatusError::Corruption("bad entry in block".to_string()));
     }
 }
 
@@ -261,8 +263,94 @@ impl Iterator for BlockIter<'_> {
 
     fn status(&mut self) -> Result<()> {
         if let Some(_) = &self.err {
-            return Err(self.err.take().unwrap())
+            return Err(self.err.take().unwrap());
         }
         Ok(())
+    }
+}
+
+pub struct BlockBuilder {
+    options: Rc<Options>,
+    buffer: Vec<u8>,    // Destination buffer
+    restarts: Vec<u32>, // Restart points
+    counter: u32,       // Number of entries emitted since restart
+    finished: bool,     // Has finish() been called?
+    last_key: Vec<u8>,
+}
+
+impl BlockBuilder {
+    pub fn new(options: Rc<Options>) -> Self {
+        assert!(options.block_restart_interval >= 1);
+        let mut restarts = Vec::new();
+        restarts.push(0);
+        BlockBuilder {
+            options,
+            buffer: Vec::new(),
+            restarts,
+            counter: 0,
+            finished: false,
+            last_key: Vec::new(),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.buffer.clear();
+        self.restarts.clear();
+        self.restarts.push(0);
+        self.counter = 0;
+        self.finished = false;
+        self.last_key.clear();
+    }
+
+    // REQUIRES: finish() has not been called since the last call to reset().
+    // REQUIRES: key is larger than any previously added key
+    pub fn add(&mut self, key: Slice, value: Slice) {
+        let last_key_piece = self.last_key.as_slice().into();
+        assert!(!self.finished);
+        assert!(self.counter <= self.options.block_restart_interval);
+        assert!(
+            self.buffer.is_empty()
+                || self.options.comparator.compare(&key, &last_key_piece) == Ordering::Greater
+        );
+
+        let mut shared = 0;
+        if self.counter < self.options.block_restart_interval {
+            let min_len = cmp::min(last_key_piece.size(), key.size());
+            // See how much sharing to do with previous string
+            while shared < min_len && last_key_piece.at(shared) == key.at(shared) {
+                shared += 1;
+            }
+        } else {
+            // Restart compression
+            self.counter = 0;
+            self.restarts.push(self.buffer.len() as u32);
+        }
+        // Add "<shared><non_shared><value_size>" to buffer_
+        put_varint32(&mut self.buffer, shared as u32);
+        put_varint32(&mut self.buffer, (key.size() - shared) as u32);
+        put_varint32(&mut self.buffer, value.size() as u32);
+        let non_share_key = key.as_ref()[shared..].as_ref();
+        self.buffer.extend_from_slice(non_share_key);
+        self.buffer.extend_from_slice(value.as_ref());
+        // Update state
+        self.counter += 1;
+        self.last_key.truncate(shared);
+        self.last_key.extend_from_slice(non_share_key);
+        assert_eq!(key.as_ref(), self.last_key.as_slice());
+    }
+
+    pub fn finish(&mut self) -> Slice {
+        for restart in self.restarts.iter() {
+            self.buffer.write_u32::<LittleEndian>(*restart).unwrap();
+        }
+        self.buffer
+            .write_u32::<LittleEndian>(self.restarts.len() as u32)
+            .unwrap();
+        self.finished = true;
+        self.buffer.as_slice().into()
+    }
+
+    pub fn current_size_estimate(&self) -> usize {
+        self.buffer.len() + self.restarts.len() * mem::size_of::<u32>() + mem::size_of::<u32>()
     }
 }
