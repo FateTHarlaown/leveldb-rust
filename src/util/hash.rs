@@ -15,7 +15,7 @@ pub fn hash(data: &[u8], seed: u32) -> u32 {
     }
 
     for i in (0..buf.len()).rev() {
-        h += (u32::from(buf[i]) << (i*8) as u32);
+        h += (u32::from(buf[i]) << (i * 8) as u32);
         if i == 0 {
             h = h.wrapping_mul(m);
             h ^= (h >> r);
