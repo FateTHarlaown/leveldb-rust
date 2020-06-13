@@ -46,10 +46,14 @@ impl FilterBlockBuilder {
         }
         let array_size = self.result.len();
         for offset in self.filter_offset.iter() {
-            self.result.write_u32::<LittleEndian>(*offset as u32);
+            self.result
+                .write_u32::<LittleEndian>(*offset as u32)
+                .unwrap();
         }
 
-        self.result.write_u32::<LittleEndian>(array_size as u32);
+        self.result
+            .write_u32::<LittleEndian>(array_size as u32)
+            .unwrap();
         self.result.push(FILTER_BASE_LG as u8);
         Slice::new(self.result.as_ptr(), self.result.len())
     }
@@ -144,11 +148,11 @@ impl<'a> FilterBlockReader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::util::filter::FilterPolicy;
     use crate::db::slice::Slice;
+    use crate::sstable::filter_block::{FilterBlockBuilder, FilterBlockReader, FILTER_BASE_LG};
+    use crate::util::filter::FilterPolicy;
     use crate::util::hash::hash;
-    use byteorder::{WriteBytesExt, LittleEndian, ReadBytesExt};
-    use crate::table::filter_block::{FilterBlockBuilder, FILTER_BASE_LG, FilterBlockReader};
+    use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
     use std::rc::Rc;
 
     struct TestHashFilter {}
@@ -178,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_empty_builder() {
-        let policy = Rc::new(TestHashFilter{});
+        let policy = Rc::new(TestHashFilter {});
         let mut builder = FilterBlockBuilder::new(policy.clone());
         let block = builder.finish();
         assert_eq!(&[0, 0, 0, 0, FILTER_BASE_LG as u8], block.as_ref());
@@ -190,7 +194,7 @@ mod tests {
 
     #[test]
     fn test_single_chunk() {
-        let policy = Rc::new(TestHashFilter{});
+        let policy = Rc::new(TestHashFilter {});
         let mut builder = FilterBlockBuilder::new(policy.clone());
         builder.start_block(100);
         builder.add_key("foo".as_bytes().into());
@@ -213,7 +217,7 @@ mod tests {
 
     #[test]
     fn test_multi_chunk() {
-        let policy = Rc::new(TestHashFilter{});
+        let policy = Rc::new(TestHashFilter {});
         let mut builder = FilterBlockBuilder::new(policy.clone());
 
         // First filter

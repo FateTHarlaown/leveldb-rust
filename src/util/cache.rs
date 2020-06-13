@@ -25,19 +25,19 @@ const NUM_SHARDS: u32 = 1 << NUM_SHARD_BITS;
 pub trait Cache<K: Sized, V: Sized> {
     // Insert a mapping from key->value into the cache and assign it
     // the specified charge against the total cache capacity.
-    fn insert(&mut self, key: K, value: V, charge: u64) -> Option<Arc<V>>;
+    fn insert(&self, key: K, value: V, charge: u64) -> Option<Arc<V>>;
 
     // If the cache has no mapping for "key", returns None.
-    fn look_up(&mut self, key: &K) -> Option<Arc<V>>;
+    fn look_up(&self, key: &K) -> Option<Arc<V>>;
 
     // If cache has the key, erase it.
-    fn erase(&mut self, key: &K);
+    fn erase(&self, key: &K);
 
     // Return a new numeric id.  May be used by multiple clients who are
     // sharing the same cache to partition the key space.  Typically the
     // client will allocate a new id at startup and prepend the id to
     // its cache keys.
-    fn new_id(&mut self) -> u64;
+    fn new_id(&self) -> u64;
 
     // Return an estimate of the combined charges of all elements stored in the
     // cache.
@@ -86,7 +86,7 @@ impl<K, V> Cache<K, V> for ShardedLruCache<K, V>
 where
     K: AsRef<[u8]> + Eq + Hash,
 {
-    fn insert(&mut self, key: K, value: V, charge: u64) -> Option<Arc<V>> {
+    fn insert(&self, key: K, value: V, charge: u64) -> Option<Arc<V>> {
         let hash_val = Self::hash_key(&key);
         let shard = Self::shard(hash_val);
         assert!(shard < NUM_SHARDS);
@@ -94,7 +94,7 @@ where
         lru.insert(key, value, charge)
     }
 
-    fn look_up(&mut self, key: &K) -> Option<Arc<V>> {
+    fn look_up(&self, key: &K) -> Option<Arc<V>> {
         let hash_val = Self::hash_key(&key);
         let shard = Self::shard(hash_val);
         assert!(shard < NUM_SHARDS);
@@ -102,7 +102,7 @@ where
         lru.look_up(key)
     }
 
-    fn erase(&mut self, key: &K) {
+    fn erase(&self, key: &K) {
         let hash_val = Self::hash_key(&key);
         let shard = Self::shard(hash_val);
         assert!(shard < NUM_SHARDS);
@@ -110,7 +110,7 @@ where
         lru.erase(key)
     }
 
-    fn new_id(&mut self) -> u64 {
+    fn new_id(&self) -> u64 {
         self.last_id.fetch_add(1, Ordering::SeqCst)
     }
 
@@ -162,7 +162,7 @@ impl<K: Eq + Hash, V> InnerLruCache<K, V> {
             charge,
         };
         if let Some(handle) = self.lru.put(key, val) {
-            Some(handle.value.clone())
+            Some(handle.value)
         } else {
             None
         }

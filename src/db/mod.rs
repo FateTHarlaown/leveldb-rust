@@ -73,7 +73,7 @@ pub trait RandomAccessFile {
     // status.
     //
     // Safe for concurrent use by multiple threads.
-    fn read(&mut self, offset: usize, n: usize, scratch: &mut Vec<u8>) -> Result<Slice>;
+    fn read(&self, offset: usize, n: usize, scratch: &mut Vec<u8>) -> Result<Slice>;
 }
 
 pub trait Reporter {

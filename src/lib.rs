@@ -1,4 +1,4 @@
 #![feature(core_intrinsics)]
 pub mod db;
-pub mod table;
+pub mod sstable;
 pub mod util;

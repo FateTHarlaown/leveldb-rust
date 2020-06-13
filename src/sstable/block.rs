@@ -2,17 +2,18 @@ use crate::db::error::{Result, StatusError};
 use crate::db::option::Options;
 use crate::db::slice::Slice;
 use crate::db::Iterator;
-use crate::table::format::BlockContent;
+use crate::sstable::format::BlockContent;
 use crate::util::buffer::BufferReader;
 use crate::util::cmp::Comparator;
-use crate::util::coding::{put_varint32, DecodeVarint, EncodeVarint};
+use crate::util::coding::{put_varint32, DecodeVarint};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::cmp::{self, Ordering};
 use std::mem;
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub struct Block {
-    content: BlockContent,
+    content: Rc<BlockContent>,
     restart_offset: u32,
 }
 
@@ -25,7 +26,7 @@ impl Block {
             ))
         } else {
             let mut block = Block {
-                content,
+                content: Rc::new(content),
                 restart_offset: 0,
             };
             let max_restart_allowed = (n - mem::size_of::<u32>()) / mem::size_of::<u32>();
@@ -50,14 +51,14 @@ impl Block {
         self.content.data.as_slice()
     }
 
-    pub fn new_iterator(&self, comparator: Rc<dyn Comparator<Slice>>) -> BlockIter {
+    pub fn new_iterator(&self, comparator: Arc<dyn Comparator<Slice>>) -> BlockIter {
         BlockIter::new(self, comparator)
     }
 }
 
-pub struct BlockIter<'a> {
-    block_data: &'a [u8], // underlying block contents
-    comparator: Rc<dyn Comparator<Slice>>,
+pub struct BlockIter {
+    block_content: Rc<BlockContent>, // underlying block contents
+    comparator: Arc<dyn Comparator<Slice>>,
     restarts: u32,     // Offset of restart array (list of fixed32)
     num_restarts: u32, // Number of uint32_t entries in restart array
     // current is offset in data of current entry.  >= restarts if !Valid
@@ -68,10 +69,10 @@ pub struct BlockIter<'a> {
     err: Option<StatusError>,
 }
 
-impl<'a> BlockIter<'a> {
-    pub fn new(block: &'a Block, comparator: Rc<dyn Comparator<Slice>>) -> Self {
+impl BlockIter {
+    pub fn new(block: &Block, comparator: Arc<dyn Comparator<Slice>>) -> Self {
         BlockIter {
-            block_data: block.data(),
+            block_content: block.content.clone(),
             comparator,
             restarts: block.restart_offset,
             num_restarts: block.num_restarts(),
@@ -94,7 +95,7 @@ impl<'a> BlockIter<'a> {
 
     fn get_restart_point(&self, index: u32) -> u32 {
         assert!(index < self.num_restarts);
-        let mut buf = self.block_data
+        let mut buf = self.block_content.data
             [self.restarts as usize + (mem::size_of::<u32>() * index as usize)..]
             .as_ref();
         buf.read_u32::<LittleEndian>().unwrap()
@@ -112,7 +113,7 @@ impl<'a> BlockIter<'a> {
             return Err(StatusError::Corruption("bad entry in block".to_string()));
         }
 
-        let mut data = self.block_data[offset as usize..].as_ref();
+        let mut data = self.block_content.data[offset as usize..].as_ref();
         let mut step = data.len();
         let (mut shared, mut non_shared, mut value_len) =
             (data[0] as u32, data[1] as u32, data[2] as u32);
@@ -143,7 +144,7 @@ impl<'a> BlockIter<'a> {
 
         if let Ok((shared, non_shared, value_len, step)) = self.decode_entry(self.current) {
             let offset = (self.current + step) as usize;
-            let mut buf = self.block_data[offset..].as_ref();
+            let mut buf = self.block_content.data[offset..].as_ref();
             let non_share_key = buf.read_bytes(non_shared as usize).unwrap();
             self.key.truncate(shared as usize);
             self.key.extend_from_slice(non_share_key);
@@ -166,7 +167,7 @@ impl<'a> BlockIter<'a> {
     }
 }
 
-impl Iterator for BlockIter<'_> {
+impl Iterator for BlockIter {
     fn valid(&self) -> bool {
         self.current < self.restarts
     }
@@ -198,7 +199,7 @@ impl Iterator for BlockIter<'_> {
                     return;
                 }
                 let offset = region_offset + step;
-                let mut buf = self.block_data[offset as usize..].as_ref();
+                let mut buf = self.block_content.data[offset as usize..].as_ref();
                 let key = buf.read_bytes(non_shared as usize).unwrap();
                 if self.compare(&key.into(), &target) == Ordering::Less {
                     left = mid;
@@ -262,7 +263,7 @@ impl Iterator for BlockIter<'_> {
     }
 
     fn status(&mut self) -> Result<()> {
-        if let Some(_) = &self.err {
+        if self.err.is_some() {
             return Err(self.err.take().unwrap());
         }
         Ok(())

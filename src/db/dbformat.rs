@@ -176,7 +176,7 @@ impl Comparator<Slice> for InternalKeyComparator {
         let user_limit = extract_user_key(limit);
         let mut tmp = Vec::from(user_start.as_ref());
         self.user_comparator
-            .find_shortest_separator(&mut tmp, user_limit.into());
+            .find_shortest_separator(&mut tmp, user_limit);
         if tmp.len() < user_start.size()
             && self
                 .user_comparator

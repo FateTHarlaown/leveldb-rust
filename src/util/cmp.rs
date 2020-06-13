@@ -90,7 +90,7 @@ impl Comparator<Slice> for BitWiseComparator {
         let mut truncate_len = 0;
         for (i, byte) in key.iter_mut().enumerate() {
             if *byte != 0xff {
-                *byte = *byte + 1;
+                *byte += 1;
                 truncate_len = i + 1;
                 break;
             }

@@ -31,28 +31,28 @@ impl BlockHandle {
         BlockHandle { offset, size }
     }
 
-    fn offset(&self) -> u64 {
+    pub fn offset(&self) -> u64 {
         self.offset
     }
 
-    fn set_offset(&mut self, offset: u64) {
+    pub fn set_offset(&mut self, offset: u64) {
         self.offset = offset
     }
 
-    fn size(&self) -> u64 {
+    pub fn size(&self) -> u64 {
         self.size
     }
 
-    fn set_size(&mut self, size: u64) {
+    pub fn set_size(&mut self, size: u64) {
         self.size = size
     }
 
-    fn encode_to(&self, dst: &mut Vec<u8>) {
+    pub fn encode_to(&self, dst: &mut Vec<u8>) {
         put_varint64(dst, self.offset);
         put_varint64(dst, self.size);
     }
 
-    fn decode_from(&mut self, input: Slice) -> Result<()> {
+    pub fn decode_from(&mut self, input: Slice) -> Result<()> {
         let mut data = input.as_ref();
         self.offset = data.decode_varint64()?;
         self.size = data.decode_varint64()?;
@@ -72,23 +72,23 @@ pub struct Footer {
 }
 
 impl Footer {
-    fn meta_index_handle(&self) -> &BlockHandle {
+    pub fn meta_index_handle(&self) -> &BlockHandle {
         &self.meta_index_handle
     }
 
-    fn index_handle(&self) -> &BlockHandle {
+    pub fn index_handle(&self) -> &BlockHandle {
         &self.index_handle
     }
 
-    fn set_meta_index_handle(&mut self, h: &BlockHandle) {
-        self.meta_index_handle = h.clone()
+    pub fn set_meta_index_handle(&mut self, h: &BlockHandle) {
+        self.meta_index_handle = *h
     }
 
-    fn set_index_handle(&mut self, h: &BlockHandle) {
-        self.index_handle = h.clone()
+    pub fn set_index_handle(&mut self, h: &BlockHandle) {
+        self.index_handle = *h
     }
 
-    fn encode_to(&self, dst: &mut Vec<u8>) {
+    pub fn encode_to(&self, dst: &mut Vec<u8>) {
         let original_size = dst.len();
         self.meta_index_handle.encode_to(dst);
         self.index_handle.encode_to(dst);
@@ -100,7 +100,7 @@ impl Footer {
         assert_eq!(dst.len(), original_size + FOOTER_ENCODED_LENGTH);
     }
 
-    fn decoded_from(&mut self, input: Slice) -> Result<()> {
+    pub fn decoded_from(&mut self, input: Slice) -> Result<()> {
         let buf = input.as_ref();
         let mut magic_buf = buf[FOOTER_ENCODED_LENGTH - 8..].as_ref();
         let magic_lo = magic_buf.decode_varint32().unwrap();
@@ -137,23 +137,21 @@ impl Drop for BlockContent {
     fn drop(&mut self) {
         // we only need to drop when heap_allocted is true
         if !self.heap_allocted {
-            let tmp = mem::replace(&mut self.data, vec![]);
-            mem::forget(tmp);
+            mem::forget(mem::take(&mut self.data));
         }
     }
 }
 
 impl BlockContent {
     pub fn read_block_from_file<R: RandomAccessFile>(
-        file: &mut R,
+        file: &R,
         handle: BlockHandle,
         option: &ReadOption,
     ) -> Result<BlockContent> {
         // Read the block contents as well as the type/crc footer.
         // See table_builder.cc for the code that built this structure.
         let n = handle.size as usize;
-        let mut buf = Vec::with_capacity(n + BLOCK_TRAILER_SIZE);
-        buf.resize(n + BLOCK_TRAILER_SIZE, 0);
+        let mut buf = vec![0; n + BLOCK_TRAILER_SIZE];
         let content = file.read(handle.offset() as usize, n + BLOCK_TRAILER_SIZE, &mut buf)?;
         if content.size() != n + BLOCK_TRAILER_SIZE {
             return Err(StatusError::Corruption("truncated block read".to_string()));
