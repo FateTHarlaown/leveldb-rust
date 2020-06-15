@@ -124,6 +124,7 @@ pub trait Iterator {
     fn status(&mut self) -> Result<()>;
 }
 
+#[derive(Clone)]
 pub struct ReadOption {
     pub verify_checksum: bool,
     pub fill_cache: bool,

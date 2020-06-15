@@ -5,11 +5,10 @@ use crate::db::{Iterator, RandomAccessFile, ReadOption};
 use crate::sstable::block::{Block, BlockIter};
 use crate::sstable::filter_block::FilterBlockReader;
 use crate::sstable::format::{BlockContent, BlockHandle, Footer, FOOTER_ENCODED_LENGTH};
+use crate::sstable::two_level_iterator::{BlockIterBuilder, TwoLevelIterator};
 use crate::util::cmp::{BitWiseComparator, Comparator};
-use crate::util::filter::FilterPolicy;
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::cmp::Ordering;
-use std::rc::Rc;
 use std::sync::Arc;
 
 // A Table is a sorted map from strings to strings.  Tables are
@@ -21,7 +20,7 @@ pub struct Table<R: RandomAccessFile> {
     options: Arc<Options>,
     metaindex_handle: BlockHandle,
     index_block: Block,
-    fileter_block_data: Option<BlockContent>,
+    filter_block_data: Option<BlockContent>,
 }
 
 impl<R: RandomAccessFile> Table<R> {
@@ -67,7 +66,7 @@ impl<R: RandomAccessFile> Table<R> {
             metaindex_handle: footer.meta_index_handle().clone(),
             index_block,
             cache_id,
-            fileter_block_data: None,
+            filter_block_data: None,
         };
         // We've successfully read the footer and the index block: we're
         // ready to serve requests.
@@ -97,14 +96,18 @@ impl<R: RandomAccessFile> Table<R> {
                 handle.decode_from(iter.value())?;
                 let filter_block_content =
                     BlockContent::read_block_from_file(&self.file, handle, &read_option)?;
-                self.fileter_block_data.get_or_insert(filter_block_content);
+                self.filter_block_data.get_or_insert(filter_block_content);
             }
         }
 
         Ok(())
     }
 
-    pub fn block_reader(&self, read_option: &ReadOption, index_value: Slice) -> Result<BlockIter> {
+    fn block_iter_from_index(
+        &self,
+        read_option: &ReadOption,
+        index_value: Slice,
+    ) -> Result<BlockIter> {
         let mut block_handle: BlockHandle = Default::default();
         block_handle.decode_from(index_value)?;
 
@@ -134,6 +137,15 @@ impl<R: RandomAccessFile> Table<R> {
         }
     }
 
+    pub fn new_iterator<'a>(&'a self, option: &ReadOption) -> Box<dyn Iterator + 'a> {
+        let index_iter = self
+            .index_block
+            .new_iterator(self.options.comparator.clone());
+        let block_iter_builder = TableBlockIterBuilder { table: self };
+        let iter = TwoLevelIterator::new(index_iter, block_iter_builder, option.clone());
+        Box::new(iter)
+    }
+
     // Calls callback with the entry found after a call
     // to Seek(key).  May not make such a call if filter policy says
     // that key is not present.
@@ -150,7 +162,7 @@ impl<R: RandomAccessFile> Table<R> {
         if index_iter.valid() {
             let mut handle = BlockHandle::default();
             handle.decode_from(index_iter.value())?;
-            if let Some(ref filter_data) = self.fileter_block_data {
+            if let Some(ref filter_data) = self.filter_block_data {
                 // use filter to check if this key exists.
                 // if the filter_date if Some, we must have filter policy.
                 let policy = self.options.filter_policy.as_ref().unwrap().clone();
@@ -161,7 +173,7 @@ impl<R: RandomAccessFile> Table<R> {
                 }
             }
 
-            let mut block_iter = self.block_reader(read_option, index_iter.value())?;
+            let mut block_iter = self.block_iter_from_index(read_option, index_iter.value())?;
             block_iter.seek(key);
             if block_iter.valid() {
                 callback(block_iter.key(), block_iter.value());
@@ -187,7 +199,7 @@ impl<R: RandomAccessFile> Table<R> {
         index_iter.seek(key);
         if index_iter.valid() {
             let mut handle = BlockHandle::default();
-            if let Ok(off) = handle.decode_from(index_iter.value()) {
+            if handle.decode_from(index_iter.value()).is_ok() {
                 handle.offset()
             } else {
                 // key is past the last key in the file.  Approximate the offset
@@ -201,5 +213,16 @@ impl<R: RandomAccessFile> Table<R> {
             // right near the end of the file).
             self.metaindex_handle.offset()
         }
+    }
+}
+
+struct TableBlockIterBuilder<'a, R: RandomAccessFile> {
+    table: &'a Table<R>,
+}
+
+impl<'a, R: RandomAccessFile> BlockIterBuilder for TableBlockIterBuilder<'a, R> {
+    type Iter = BlockIter;
+    fn build(&self, option: &ReadOption, index_val: Slice) -> Result<Self::Iter> {
+        self.table.block_iter_from_index(option, index_val)
     }
 }
