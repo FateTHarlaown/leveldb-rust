@@ -271,7 +271,8 @@ impl Iterator for BlockIter {
 }
 
 pub struct BlockBuilder {
-    options: Rc<Options>,
+    comparator: Arc<dyn Comparator<Slice>>,
+    block_restart_interval: u32,
     buffer: Vec<u8>,    // Destination buffer
     restarts: Vec<u32>, // Restart points
     counter: u32,       // Number of entries emitted since restart
@@ -280,12 +281,13 @@ pub struct BlockBuilder {
 }
 
 impl BlockBuilder {
-    pub fn new(options: Rc<Options>) -> Self {
-        assert!(options.block_restart_interval >= 1);
+    pub fn new(comparator: Arc<dyn Comparator<Slice>>, block_restart_interval: u32) -> Self {
+        assert!(block_restart_interval >= 1);
         let mut restarts = Vec::new();
         restarts.push(0);
         BlockBuilder {
-            options,
+            comparator,
+            block_restart_interval,
             buffer: Vec::new(),
             restarts,
             counter: 0,
@@ -308,14 +310,14 @@ impl BlockBuilder {
     pub fn add(&mut self, key: Slice, value: Slice) {
         let last_key_piece = self.last_key.as_slice().into();
         assert!(!self.finished);
-        assert!(self.counter <= self.options.block_restart_interval);
+        assert!(self.counter <= self.block_restart_interval);
         assert!(
             self.buffer.is_empty()
-                || self.options.comparator.compare(&key, &last_key_piece) == Ordering::Greater
+                || self.comparator.compare(&key, &last_key_piece) == Ordering::Greater
         );
 
         let mut shared = 0;
-        if self.counter < self.options.block_restart_interval {
+        if self.counter < self.block_restart_interval {
             let min_len = cmp::min(last_key_piece.size(), key.size());
             // See how much sharing to do with previous string
             while shared < min_len && last_key_piece.at(shared) == key.at(shared) {
@@ -353,5 +355,9 @@ impl BlockBuilder {
 
     pub fn current_size_estimate(&self) -> usize {
         self.buffer.len() + self.restarts.len() * mem::size_of::<u32>() + mem::size_of::<u32>()
+    }
+
+    pub fn empty(&self) -> bool {
+        self.buffer.is_empty()
     }
 }

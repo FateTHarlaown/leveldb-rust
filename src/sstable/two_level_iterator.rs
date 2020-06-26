@@ -47,7 +47,10 @@ impl<I: Iterator, B: BlockIterBuilder> TwoLevelIterator<I, B> {
                         self.data_block_handle.extend_from_slice(handle.as_ref());
                         self.set_data_iterator(Some(iter))
                     }
-                    Err(e) => self.save_error(e),
+                    Err(e) => {
+                        self.data_iter = None;
+                        self.save_error(e);
+                    }
                 }
             }
             // data_iter is already constructed with this iterator, so

@@ -13,6 +13,7 @@ use std::sync::Arc;
 pub const NO_COMPRESSION: u8 = 0x0;
 pub const SNAPPY_COMPRESSION: u8 = 0x1;
 
+#[derive(Clone)]
 pub struct Options {
     // -------------------
     // Parameters that affect behavior
@@ -41,6 +42,12 @@ pub struct Options {
     // If Some, use the specified cache for blocks.
     // If None, leveldb will automatically create and use an 8MB internal cache.
     pub block_cache: Option<Arc<dyn Cache<Vec<u8>, Block>>>,
+
+    // Approximate size of user data packed per block.  Note that the
+    // block size specified here corresponds to uncompressed data.  The
+    // actual size of the unit read from disk may be smaller if
+    // compression is enabled.  This parameter can be changed dynamically.
+    pub block_size: usize,
 
     // Number of keys between restart points for delta encoding of keys.
     // This parameter can be changed dynamically.  Most clients should
@@ -73,6 +80,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             comparator: Arc::new(BitWiseComparator {}),
+            block_size: 4 * 1024,
             block_restart_interval: 16,
             compression_type: SNAPPY_COMPRESSION,
             paranoid_checks: false,
