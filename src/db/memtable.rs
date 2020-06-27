@@ -3,9 +3,10 @@ use crate::db::dbformat::{TYPE_DELETION, TYPE_VALUE};
 use crate::db::error::{Result, StatusError};
 use crate::db::skiplist::{SkipList, SkipListIterator};
 use crate::db::slice::Slice;
+use crate::db::Iterator;
 use crate::util::arena::Arena;
 use crate::util::cmp::{BitWiseComparator, Comparator};
-use crate::util::coding::{varint_length, DecodeVarint, EncodeVarint};
+use crate::util::coding::{varint_length, DecodeVarint, EncodeVarint, put_varint32};
 
 use crate::util::buffer::BufferReader;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -83,4 +84,78 @@ impl MemTable {
         }
         Err(StatusError::NotFound("no key".to_string()))
     }
+
+    pub fn approximate_memory_usage(&self) -> usize {
+        self.arena.borrow().memory_usage()
+    }
 }
+
+pub struct MemTableIterator<'a> {
+    iter: SkipListIterator<'a, Slice>,
+    tmp: Vec<u8>,
+}
+
+impl<'a> MemTableIterator<'a> {
+    pub fn new(iter: SkipListIterator<'a, Slice>) -> Self {
+        MemTableIterator {
+            iter,
+            tmp: Vec::new(),
+        }
+    }
+}
+
+impl<'a> Iterator for MemTableIterator<'a> {
+    fn valid(&self) -> bool {
+        self.iter.valid()
+    }
+
+    fn seek_to_first(&mut self) {
+        self.iter.seek_to_first()
+    }
+
+    fn seek_to_last(&mut self) {
+        self.iter.seek_to_last()
+    }
+
+    fn seek(&mut self, target: Slice) {
+        self.iter.seek(&target)
+    }
+
+    fn next(&mut self) {
+        self.iter.next()
+    }
+
+    fn prev(&mut self) {
+        self.iter.prev()
+    }
+
+    fn key(&self) -> Slice {
+        get_length_prefixed_slice(self.iter.key())
+    }
+
+    fn value(&self) -> Slice {
+        let mut raw_key = self.iter.key();
+        let key_slice = get_length_prefixed_slice(raw_key);
+        let mut buf = raw_key.as_ref();
+        buf.advance(key_slice.size());
+        get_length_prefixed_slice(&buf.into())
+    }
+
+    fn status(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn get_length_prefixed_slice(key: &Slice) -> Slice {
+    let mut buf = key.as_ref();
+    let len = buf.decode_varint32().unwrap();
+    Slice::new(buf.as_ptr(), len as usize)
+}
+
+fn encode_key(scratch: &mut Vec<u8>, target: Slice) -> Slice {
+    scratch.clear();
+    put_varint32(scratch, target.size() as u32);
+    scratch.extend_from_slice(target.as_ref());
+    scratch.as_slice().into()
+}
+
