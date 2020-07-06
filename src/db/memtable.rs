@@ -6,7 +6,7 @@ use crate::db::slice::Slice;
 use crate::db::Iterator;
 use crate::util::arena::Arena;
 use crate::util::cmp::{BitWiseComparator, Comparator};
-use crate::util::coding::{varint_length, DecodeVarint, EncodeVarint, put_varint32};
+use crate::util::coding::{put_varint32, varint_length, DecodeVarint, EncodeVarint};
 
 use crate::util::buffer::BufferReader;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -158,4 +158,3 @@ fn encode_key(scratch: &mut Vec<u8>, target: Slice) -> Slice {
     scratch.extend_from_slice(target.as_ref());
     scratch.as_slice().into()
 }
-
