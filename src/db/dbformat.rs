@@ -61,9 +61,9 @@ pub fn parse_internal_key(internal_key: Slice, result: &mut ParsedInternalKey) -
 }
 
 pub struct ParsedInternalKey {
-    user_key: Slice,
-    sequence: SequenceNumber,
-    val_type: ValueType,
+    pub user_key: Slice,
+    pub sequence: SequenceNumber,
+    pub val_type: ValueType,
 }
 
 impl Default for ParsedInternalKey {

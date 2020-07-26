@@ -1,4 +1,4 @@
-use crate::db::dbformat::{LookupKey, SequenceNumber, ValueType};
+use crate::db::dbformat::{InternalKeyComparator, LookupKey, SequenceNumber, ValueType};
 use crate::db::dbformat::{TYPE_DELETION, TYPE_VALUE};
 use crate::db::error::{Result, StatusError};
 use crate::db::skiplist::{SkipList, SkipListIterator};
@@ -10,9 +10,10 @@ use crate::util::coding::{put_varint32, varint_length, DecodeVarint, EncodeVarin
 
 use crate::util::buffer::BufferReader;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use failure::_core::cmp::Ordering;
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::io::Write;
+use std::mem;
 use std::rc::Rc;
 use std::slice;
 
@@ -26,7 +27,11 @@ impl MemTable {
     pub fn new() -> Self {
         let arena = Rc::new(RefCell::new(Arena::new()));
         let comparator = Rc::new(BitWiseComparator {});
-        let table = SkipList::new(comparator.clone(), arena.clone(), Slice::default());
+        let internal_key_comparator = InternalKeyComparator::new(comparator.clone());
+        let key_comparator = KeyComparator {
+            comparator: internal_key_comparator,
+        };
+        let table = SkipList::new(Rc::new(key_comparator), arena.clone(), Slice::default());
         MemTable {
             arena,
             table,
@@ -41,22 +46,28 @@ impl MemTable {
         //  value_size   : varint32 of value.size()
         //  value bytes  : char[value.size()]
         let key_size = key.size();
-        let val_size = key.size();
+        let val_size = val.size();
         let internal_key_size = key_size + 8;
         let encode_len = varint_length(internal_key_size as u64)
             + internal_key_size
             + varint_length(val_size as u64)
             + val_size;
 
-        let mem = self.arena.borrow_mut().allocate_aligned(encode_len);
-        let mut buf = unsafe { slice::from_raw_parts_mut(mem, encode_len) };
+        let mem_area = self.arena.borrow_mut().allocate_aligned(encode_len);
+        let mut buf = unsafe { Vec::from_raw_parts(mem_area, encode_len, encode_len) };
+        let mut writer = buf.as_mut_slice();
         // internal_key_size must not overflow
-        buf.encode_varint32(internal_key_size as u32).unwrap();
-        buf.write_all(key.as_ref()).unwrap();
-        buf.write_u64::<LittleEndian>((s << 8) | val_type).unwrap();
-        buf.encode_varint32(val_size as u32).unwrap();
-        buf.write_all(val.as_ref()).unwrap();
-        self.table.insert(buf.as_ref().into());
+        writer.encode_varint32(internal_key_size as u32).unwrap();
+        writer.write_all(key.as_ref()).unwrap();
+        writer
+            .write_u64::<LittleEndian>((s << 8) | val_type)
+            .unwrap();
+        writer.encode_varint32(val_size as u32).unwrap();
+        if !val.is_empty() {
+            writer.write_all(val.as_ref()).unwrap();
+        }
+        self.table.insert(buf.as_slice().into());
+        mem::forget(buf);
     }
 
     pub fn get(&self, key: &LookupKey) -> Result<Option<Slice>> {
@@ -87,6 +98,10 @@ impl MemTable {
 
     pub fn approximate_memory_usage(&self) -> usize {
         self.arena.borrow().memory_usage()
+    }
+
+    pub fn iter(&'a self) -> Box<dyn Iterator + 'a> {
+        Box::new(MemTableIterator::new(SkipListIterator::new(&self.table)))
     }
 }
 
@@ -130,15 +145,15 @@ impl<'a> Iterator for MemTableIterator<'a> {
     }
 
     fn key(&self) -> Slice {
-        get_length_prefixed_slice(self.iter.key())
+        let mut buf = self.iter.key().as_ref();
+        get_length_prefixed_slice(&mut buf)
     }
 
     fn value(&self) -> Slice {
         let mut raw_key = self.iter.key();
-        let key_slice = get_length_prefixed_slice(raw_key);
         let mut buf = raw_key.as_ref();
-        buf.advance(key_slice.size());
-        get_length_prefixed_slice(&buf.into())
+        get_length_prefixed_slice(&mut buf);
+        get_length_prefixed_slice(&mut buf)
     }
 
     fn status(&mut self) -> Result<()> {
@@ -146,10 +161,33 @@ impl<'a> Iterator for MemTableIterator<'a> {
     }
 }
 
-fn get_length_prefixed_slice(key: &Slice) -> Slice {
-    let mut buf = key.as_ref();
+struct KeyComparator {
+    comparator: InternalKeyComparator,
+}
+
+impl Comparator<Slice> for KeyComparator {
+    fn compare(&self, left: &Slice, right: &Slice) -> Ordering {
+        let left_key = get_length_prefixed_slice(&mut left.as_ref());
+        let right_key = get_length_prefixed_slice(&mut right.as_ref());
+        self.comparator.compare(&left_key, &right_key)
+    }
+
+    fn name(&self) -> &'static str {
+        "leveldb.KeyComparator"
+    }
+
+    fn find_shortest_separator(&self, start: &mut Vec<u8>, limit: Slice) {
+        self.comparator.find_shortest_separator(start, limit)
+    }
+
+    fn find_short_successor(&self, key: &mut Vec<u8>) {
+        self.comparator.find_short_successor(key)
+    }
+}
+
+fn get_length_prefixed_slice(mut buf: &mut &[u8]) -> Slice {
     let len = buf.decode_varint32().unwrap();
-    Slice::new(buf.as_ptr(), len as usize)
+    buf.read_bytes(len as usize).unwrap().into()
 }
 
 fn encode_key(scratch: &mut Vec<u8>, target: Slice) -> Slice {

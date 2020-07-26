@@ -1,4 +1,5 @@
 use crate::db::error::{Result, StatusError};
+use crate::db::option::Options;
 use crate::db::slice::Slice;
 
 mod dbformat;
@@ -8,6 +9,7 @@ mod memtable;
 pub mod option;
 pub mod skiplist;
 pub mod slice;
+mod write_batch;
 
 // DB contents are stored in a set of blocks, each of which holds a
 // sequence of key,value pairs.  Each block may be compressed before
@@ -137,4 +139,43 @@ impl Default for ReadOption {
             fill_cache: true,
         }
     }
+}
+
+pub struct WriteOption {
+    // If true, the write will be flushed from the operating system
+    // buffer cache (by calling WritableFile::Sync()) before the write
+    // is considered complete.  If this flag is true, writes will be
+    // slower.
+    //
+    // If this flag is false, and the machine crashes, some recent
+    // writes may be lost.  Note that if it is just the process that
+    // crashes (i.e., the machine does not reboot), no writes will be
+    // lost even if sync==false.
+    //
+    // In other words, a DB write with sync==false has similar
+    // crash semantics as the "write()" system call.  A DB write
+    // with sync==true has similar crash semantics to a "write()"
+    // system call followed by "fsync()".
+    sync: bool,
+}
+
+impl Default for WriteOption {
+    fn default() -> Self {
+        WriteOption { sync: false }
+    }
+}
+
+// A DB is a persistent ordered map from keys to values.
+// A DB is safe for concurrent access from multiple threads without
+// any external synchronization.
+pub trait DB {
+    // Set the database entry for "key" to "value".  Returns OK on success,
+    // Note: consider setting options.sync = true.
+    fn put(&mut self, option: &WriteOption, key: Slice, value: Slice) -> Result<()>;
+
+    // Remove the database entry (if any) for "key".  Returns OK on
+    // success, and a non-OK status on error.  It is not an error if "key"
+    // did not exist in the database.
+    // Note: consider setting options.sync = true.
+    fn delete(&mut self, option: &WriteOption, key: Slice) -> Result<()>;
 }
