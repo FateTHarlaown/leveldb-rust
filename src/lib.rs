@@ -2,5 +2,6 @@
 #![feature(in_band_lifetimes)]
 
 pub mod db;
-pub mod sstable;
-pub mod util;
+mod sstable;
+mod util;
+mod env;
