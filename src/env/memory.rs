@@ -1,16 +1,16 @@
-use std::sync::{Arc, Mutex};
-use crate::env::Env;
 use crate::db::error::{Result, StatusError};
 use crate::db::slice::Slice;
+use crate::db::{RandomAccessFile, SequentialFile, WritableFile};
+use crate::env::Env;
 use crate::util::buffer::{BufferReader, BufferWriter};
-use crate::db::{SequentialFile, RandomAccessFile, WritableFile};
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 const BLOCK_SIZE: usize = 8 * 1024;
 
 #[derive(Clone)]
 pub struct FileState {
-    inner: Arc<Mutex<InnerFileState>>
+    inner: Arc<Mutex<InnerFileState>>,
 }
 
 pub struct InnerFileState {
@@ -39,7 +39,9 @@ impl FileState {
     pub fn read(&self, offset: usize, mut n: usize, scratch: &mut Vec<u8>) -> Result<usize> {
         let state = self.inner.lock().unwrap();
         if offset > state.size {
-            return Err(StatusError::Eof("Offset greater than file size".to_string()));
+            return Err(StatusError::Eof(
+                "Offset greater than file size".to_string(),
+            ));
         }
 
         let available = state.size - offset;
@@ -69,13 +71,12 @@ impl FileState {
         }
 
         Ok(n)
-
     }
 
     pub fn append(&mut self, data: &[u8]) -> Result<()> {
         let mut buf = data;
         let mut state = self.inner.lock().unwrap();
-        while buf.len() > 0  {
+        while buf.len() > 0 {
             let mut avail = 0;
             let offset = state.size % BLOCK_SIZE;
             if offset != 0 {
@@ -90,7 +91,7 @@ impl FileState {
                 avail = buf.len()
             }
             let append_data = buf.read_bytes(avail).unwrap();
-            let last = state.blocks.len()-1;
+            let last = state.blocks.len() - 1;
             let block = state.blocks.get_mut(last).unwrap();
             block.extend_from_slice(append_data);
             state.size += avail;
@@ -111,10 +112,7 @@ pub struct MemSequentialFile {
 
 impl MemSequentialFile {
     pub fn new(file: FileState) -> Self {
-        MemSequentialFile {
-            file,
-            pos: 0,
-        }
+        MemSequentialFile { file, pos: 0 }
     }
 }
 
@@ -147,28 +145,24 @@ pub struct MemRandomAccessFile {
 
 impl MemRandomAccessFile {
     pub fn new(file: FileState) -> Self {
-        MemRandomAccessFile {
-            file
-        }
+        MemRandomAccessFile { file }
     }
 }
 
 impl RandomAccessFile for MemRandomAccessFile {
     fn read(&self, offset: usize, n: usize, scratch: &mut Vec<u8>) -> Result<Slice> {
-        let len = self.file.read(offset, n , scratch)?;
+        let len = self.file.read(offset, n, scratch)?;
         Ok(Slice::new(scratch.as_ptr(), len))
     }
 }
 
 pub struct MemWritableFile {
-    file: FileState
+    file: FileState,
 }
 
 impl MemWritableFile {
     pub fn new(file: FileState) -> Self {
-        MemWritableFile {
-            file
-        }
+        MemWritableFile { file }
     }
 }
 
@@ -188,18 +182,17 @@ impl WritableFile for MemWritableFile {
     fn sync(&mut self) -> Result<()> {
         Ok(())
     }
-
 }
 
 #[derive(Clone)]
 pub struct MemEnv {
-    file_map: Arc<Mutex<BTreeMap<String, FileState>>>
+    file_map: Arc<Mutex<BTreeMap<String, FileState>>>,
 }
 
 impl MemEnv {
     pub fn new() -> Self {
         MemEnv {
-            file_map: Arc::new(Mutex::new(BTreeMap::new()))
+            file_map: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -256,11 +249,11 @@ impl Env for MemEnv {
     fn get_children(&self, name: &String, result: &mut Vec<String>) -> Result<()> {
         let map = self.file_map.lock().unwrap();
         result.clear();
-        map.iter().for_each(|(file_name, _)|{
+        map.iter().for_each(|(file_name, _)| {
             if file_name.len() >= name.len() + 1 && file_name.starts_with(name) {
-                if let Some(ch)  = file_name.chars().nth(name.len()) {
+                if let Some(ch) = file_name.chars().nth(name.len()) {
                     if ch == '/' {
-                        result.push(file_name[name.len()+1..].to_string())
+                        result.push(file_name[name.len() + 1..].to_string())
                     }
                 }
             }
@@ -353,15 +346,23 @@ mod tests {
         assert_eq!(env.get_file_size(&"/dir/f".to_string()).unwrap(), 8);
 
         // Check that renaming works.
-        assert!(env.rename_file(&"/dir/non_existent".to_string(), &"/dir/g".to_string()).is_err());
-        assert!(env.rename_file(&"/dir/f".to_string(), &"/dir/g".to_string()).is_ok());
+        assert!(env
+            .rename_file(&"/dir/non_existent".to_string(), &"/dir/g".to_string())
+            .is_err());
+        assert!(env
+            .rename_file(&"/dir/f".to_string(), &"/dir/g".to_string())
+            .is_ok());
         assert!(!env.file_exists(&"/dir/f".to_string()));
         assert!(env.file_exists(&"/dir/g".to_string()));
         assert_eq!(env.get_file_size(&"/dir/g".to_string()).unwrap(), 8);
 
         // Check that opening non-existent file fails.
-        assert!(env.new_sequential_file(&"/dir/non_existent".to_string()).is_err());
-        assert!(env.new_random_access_file(&"/dir/non_existent".to_string()).is_err());
+        assert!(env
+            .new_sequential_file(&"/dir/non_existent".to_string())
+            .is_err());
+        assert!(env
+            .new_random_access_file(&"/dir/non_existent".to_string())
+            .is_err());
 
         // Check that deleting works.
         assert!(env.delete_file(&"/dir/non_existent".to_string()).is_err());
@@ -428,7 +429,7 @@ mod tests {
         scratch.resize((write_size * 2) as usize, 0);
 
         let mut write_data = Vec::new();
-        for i in 0.. write_size {
+        for i in 0..write_size {
             write_data.push(i as u8);
         }
 
@@ -468,4 +469,3 @@ mod tests {
         assert_eq!(ret_data.as_ref(), write_2_data);
     }
 }
-

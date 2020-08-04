@@ -1,8 +1,8 @@
-mod posix;
 mod memory;
+mod posix;
 
 use crate::db::error::{Result, StatusError};
-use crate::db::{SequentialFile, RandomAccessFile, WritableFile};
+use crate::db::{RandomAccessFile, SequentialFile, WritableFile};
 
 pub trait Env: Clone {
     type SeqFile: SequentialFile;
@@ -62,7 +62,12 @@ pub trait Env: Clone {
     //TODO: add many other func
 }
 
-pub fn do_write_string_to_file<E: Env>(env: E, data: &[u8], file_name: &String, sync: bool) -> Result<()> {
+pub fn do_write_string_to_file<E: Env>(
+    env: E,
+    data: &[u8],
+    file_name: &String,
+    sync: bool,
+) -> Result<()> {
     let mut file = env.new_writable_file(file_name)?;
     file.append(data)?;
     if sync {
@@ -71,7 +76,7 @@ pub fn do_write_string_to_file<E: Env>(env: E, data: &[u8], file_name: &String, 
     Ok(())
 }
 
-pub fn write_string_to_file<E: Env> (env: E, data: &[u8], file_name: &String) -> Result<()> {
+pub fn write_string_to_file<E: Env>(env: E, data: &[u8], file_name: &String) -> Result<()> {
     let ret = do_write_string_to_file(env.clone(), data, file_name, false);
     if ret.is_err() {
         env.delete_file(file_name);
@@ -79,7 +84,7 @@ pub fn write_string_to_file<E: Env> (env: E, data: &[u8], file_name: &String) ->
     ret
 }
 
-pub fn write_string_to_file_sync<E: Env> (env: E, data: &[u8], file_name: &String) -> Result<()> {
+pub fn write_string_to_file_sync<E: Env>(env: E, data: &[u8], file_name: &String) -> Result<()> {
     let ret = do_write_string_to_file(env.clone(), data, file_name, true);
     if ret.is_err() {
         env.delete_file(file_name);
