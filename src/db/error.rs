@@ -1,5 +1,6 @@
 use failure::Fail;
 
+use failure::_core::num::ParseIntError;
 use std::io;
 use std::result;
 
@@ -29,5 +30,11 @@ pub enum StatusError {
 impl From<io::Error> for StatusError {
     fn from(err: io::Error) -> Self {
         StatusError::IOError(err)
+    }
+}
+
+impl From<ParseIntError> for StatusError {
+    fn from(err: ParseIntError) -> Self {
+        StatusError::Corruption(err.to_string())
     }
 }

@@ -4,6 +4,7 @@ use crate::db::slice::Slice;
 
 mod dbformat;
 pub mod error;
+mod filename;
 pub mod log;
 mod memtable;
 pub mod option;
