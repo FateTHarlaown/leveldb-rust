@@ -157,15 +157,13 @@ impl<K: Eq + Hash, V> InnerLruCache<K, V> {
             self.usage -= evicted_val.charge;
         }
 
+        let val_arc = Arc::new(value);
         let val = LruValue {
-            value: Arc::new(value),
+            value: val_arc.clone(),
             charge,
         };
-        if let Some(handle) = self.lru.put(key, val) {
-            Some(handle.value)
-        } else {
-            None
-        }
+        self.lru.put(key, val);
+        Some(val_arc)
     }
 
     pub fn look_up(&mut self, key: &K) -> Option<Arc<V>> {
