@@ -10,6 +10,7 @@ mod memtable;
 pub mod option;
 pub mod skiplist;
 pub mod slice;
+mod table_cache;
 mod write_batch;
 
 // DB contents are stored in a set of blocks, each of which holds a
