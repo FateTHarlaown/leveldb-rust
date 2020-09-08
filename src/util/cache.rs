@@ -292,7 +292,7 @@ mod tests {
         assert_eq!(101, tester.look_up(100).unwrap());
         assert_eq!(201, tester.look_up(200).unwrap());
 
-        assert_eq!(101, tester.insert(100, 102, 1).unwrap());
+        assert_eq!(102, tester.insert(100, 102, 1).unwrap());
         assert_eq!(102, tester.look_up(100).unwrap());
         assert_eq!(201, tester.look_up(200).unwrap());
         assert_eq!(None, tester.look_up(300));
