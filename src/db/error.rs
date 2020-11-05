@@ -1,5 +1,6 @@
 use failure::Fail;
 
+use crossbeam_channel::RecvError;
 use failure::_core::num::ParseIntError;
 use std::io;
 use std::result;
@@ -25,6 +26,9 @@ pub enum StatusError {
 
     #[fail(display = "{}", _0)]
     Eof(String),
+
+    #[fail(display = "{}", _0)]
+    RecvError(RecvError),
 }
 
 impl From<io::Error> for StatusError {
@@ -35,6 +39,12 @@ impl From<io::Error> for StatusError {
 
 impl From<ParseIntError> for StatusError {
     fn from(err: ParseIntError) -> Self {
+        StatusError::Corruption(err.to_string())
+    }
+}
+
+impl From<RecvError> for StatusError {
+    fn from(err: RecvError) -> Self {
         StatusError::Corruption(err.to_string())
     }
 }

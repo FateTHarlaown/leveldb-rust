@@ -54,7 +54,7 @@ where
 
 impl<K, V> ShardedLruCache<K, V>
 where
-    K: AsRef<[u8]> + Eq + Hash,
+    K: AsRef<[u8]> + Eq + Hash + Send,
 {
     pub fn new(capacity: u64) -> Self {
         let per_shard = (capacity + (NUM_SHARDS - 1) as u64) / NUM_SHARDS as u64;
@@ -84,7 +84,7 @@ where
 
 impl<K, V> Cache<K, V> for ShardedLruCache<K, V>
 where
-    K: AsRef<[u8]> + Eq + Hash,
+    K: AsRef<[u8]> + Eq + Hash + Send,
 {
     fn insert(&self, key: K, value: V, charge: u64) -> Option<Arc<V>> {
         let hash_val = Self::hash_key(&key);

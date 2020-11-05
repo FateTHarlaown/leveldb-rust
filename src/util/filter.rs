@@ -237,7 +237,6 @@ mod tests {
             }
             tester.build();
 
-
             assert!(tester.filter_size() <= ((length * 10 / 8) + 40) as usize);
 
             // All added keys must match
@@ -247,7 +246,12 @@ mod tests {
 
             // Check false positive rate
             let rate = tester.false_positive_rate();
-            println!("rate {}, len {}, byte {} ", rate, length, tester.filter_size());
+            println!(
+                "rate {}, len {}, byte {} ",
+                rate,
+                length,
+                tester.filter_size()
+            );
             assert!(rate <= 0.027);
             if rate > 0.0125 {
                 mediocre_filters += 1;

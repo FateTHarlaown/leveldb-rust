@@ -4,10 +4,10 @@ mod posix;
 use crate::db::error::{Result, StatusError};
 use crate::db::{RandomAccessFile, SequentialFile, WritableFile};
 
-pub trait Env: Clone {
-    type SeqFile: SequentialFile;
-    type RndFile: RandomAccessFile;
-    type WrFile: WritableFile;
+pub trait Env: Send + Sync + Clone + 'static {
+    type SeqFile: SequentialFile + 'static;
+    type RndFile: RandomAccessFile + 'static;
+    type WrFile: WritableFile + 'static;
     // Create an object that sequentially reads the file with the specified name.
     // Implementations should return Err(NotFound) when the file does not exist.
     // The returned file will only be accessed by one thread at a time.

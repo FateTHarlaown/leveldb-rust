@@ -153,12 +153,15 @@ impl<R: RandomAccessFile> Table<R> {
     // Calls callback with the entry found after a call
     // to Seek(key).  May not make such a call if filter policy says
     // that key is not present.
-    pub fn internal_get(
+    pub fn internal_get<CB>(
         &self,
         read_option: &ReadOption,
         key: Slice,
-        callback: Box<dyn Fn(Slice, Slice)>,
-    ) -> Result<()> {
+        mut callback: CB,
+    ) -> Result<()>
+    where
+        CB: FnMut(Slice, Slice),
+    {
         let mut index_iter = self
             .index_block
             .new_iterator(self.options.comparator.clone());

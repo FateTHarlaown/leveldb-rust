@@ -68,3 +68,11 @@ impl AsRef<[u8]> for Slice {
         unsafe { slice::from_raw_parts(self.data, self.size) }
     }
 }
+
+impl ToString for Slice {
+    fn to_string(&self) -> String {
+        let mut tmp = Vec::with_capacity(self.size);
+        tmp.extend_from_slice(self.as_ref());
+        String::from_utf8_lossy(self.as_ref()).to_string()
+    }
+}

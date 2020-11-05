@@ -51,6 +51,10 @@ impl<W: WritableFile> LogWriter<W> {
         Ok(())
     }
 
+    pub fn sync(&mut self) -> Result<()> {
+        self.writer.sync()
+    }
+
     fn emit_physical_record(&mut self, record_type: RecordType, data: &[u8]) -> Result<()> {
         assert!(self.offset + HEADER_SIZE + data.len() <= BLOCK_SIZE);
 

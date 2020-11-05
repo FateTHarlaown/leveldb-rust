@@ -7,26 +7,33 @@ use crate::db::{RandomAccessFile, ReadOption};
 use crate::env::Env;
 use crate::sstable::table::Table;
 use crate::util::cache::{Cache, ShardedLruCache};
+use byteorder::{LittleEndian, WriteBytesExt};
 use failure::_core::marker::PhantomData;
 use std::sync::Arc;
 
-pub struct TableCache<C, E>
-where
-    C: Cache<u64, Table<E::RndFile>>,
-    E: Env
-{
+const KEY_LEN: usize = std::mem::size_of::<u64>();
+
+pub struct TableCache<E: Env> {
     env: E,
     dbname: String,
     option: Arc<Options>,
-    cache: C,
+    cache: Arc<dyn Cache<Vec<u8>, Table<E::RndFile>>>,
 }
 
-impl<C, E> TableCache<C, E>
-where
-    C: Cache<u64, Table<E::RndFile>>,
-    E: Env
-{
-    pub fn new(dbname: String, option: Arc<Options>, cache: C, env: E) -> Self {
+impl<E: Env> Clone for TableCache<E> {
+    fn clone(&self) -> Self {
+        TableCache {
+            env: self.env.clone(),
+            dbname: self.dbname.clone(),
+            option: self.option.clone(),
+            cache: self.cache.clone(),
+        }
+    }
+}
+
+impl<E: Env> TableCache<E> {
+    pub fn new(dbname: String, option: Arc<Options>, env: E, size: u64) -> Self {
+        let cache = Arc::new(ShardedLruCache::new(size));
         TableCache {
             env,
             dbname,
@@ -36,28 +43,35 @@ where
     }
 
     pub fn evict(&self, file_number: u64) {
-        self.cache.erase(&file_number)
+        let mut key = Vec::with_capacity(KEY_LEN);
+        key.write_u64::<LittleEndian>(file_number).unwrap();
+        self.cache.erase(&key)
     }
 
-    pub fn get(
+    pub fn get<CB>(
         &self,
         option: &ReadOption,
         file_number: u64,
         file_size: u64,
         key: Slice,
-        callback: Box<dyn Fn(Slice, Slice)>,
-    ) -> Result<()> {
-        let hanlde = self.find_table(file_number, file_size)?;
-        hanlde.internal_get(option, key, callback)
+        callback: CB,
+    ) -> Result<()>
+    where
+        CB: FnMut(Slice, Slice),
+    {
+        let handle = self.find_table(file_number, file_size)?;
+        handle.internal_get(option, key, callback)
     }
 
     pub fn find_table(&self, file_number: u64, file_size: u64) -> Result<Arc<Table<E::RndFile>>> {
-        if let Some(handle) = self.cache.look_up(&file_number) {
+        let mut key = Vec::with_capacity(KEY_LEN);
+        key.write_u64::<LittleEndian>(file_number).unwrap();
+        if let Some(handle) = self.cache.look_up(&key) {
             Ok(handle)
         } else {
             let file = self.open_table_file(file_number)?;
             let table = Table::open(self.option.clone(), file, file_size)?;
-            if let Some(handle) = self.cache.insert(file_number, table, 1) {
+            if let Some(handle) = self.cache.insert(key, table, 1) {
                 Ok(handle)
             } else {
                 Err(StatusError::NotSupported(

@@ -1,7 +1,9 @@
 use crate::db::error::{Result, StatusError};
 use crate::db::option::Options;
 use crate::db::slice::Slice;
+use crate::db::write_batch::WriteBatch;
 
+mod db_impl;
 mod dbformat;
 pub mod error;
 mod filename;
@@ -11,6 +13,7 @@ pub mod option;
 pub mod skiplist;
 pub mod slice;
 mod table_cache;
+mod version;
 mod write_batch;
 
 // DB contents are stored in a set of blocks, each of which holds a
@@ -130,8 +133,17 @@ pub trait Iterator {
 
 #[derive(Clone)]
 pub struct ReadOption {
+    // If true, all data read from underlying storage will be
+    // verified against corresponding checksums.
     pub verify_checksum: bool,
+
+    // Should the data read for this iteration be cached in memory?
+    // Callers may wish to set this field to false for bulk scans.
     pub fill_cache: bool,
+    // If "snapshot" is non-null, read as of the supplied snapshot
+    // (which must belong to the DB that is being read and which must
+    // not have been released).  If "snapshot" is null, use an implicit
+    // snapshot of the state at the beginning of this read operation.
 }
 
 impl Default for ReadOption {
@@ -171,6 +183,7 @@ impl Default for WriteOption {
 // A DB is safe for concurrent access from multiple threads without
 // any external synchronization.
 pub trait DB {
+    /*
     // Set the database entry for "key" to "value".  Returns OK on success,
     // Note: consider setting options.sync = true.
     fn put(&mut self, option: &WriteOption, key: Slice, value: Slice) -> Result<()>;
@@ -180,4 +193,19 @@ pub trait DB {
     // did not exist in the database.
     // Note: consider setting options.sync = true.
     fn delete(&mut self, option: &WriteOption, key: Slice) -> Result<()>;
+     */
+
+    // If the database contains an entry for "key" store the
+    // corresponding value in *value and return OK.
+    //
+    // If there is no entry for "key" leave *value unchanged and return
+    // a status for which Status::IsNotFound() returns true.
+    //
+    // May return some other Status on an error.
+    fn get(&self, options: &ReadOption, key: Slice, val: &mut Vec<u8>) -> Result<()>;
+
+    // Apply the specified updates to the database.
+    // Returns OK on success, non-OK on failure.
+    // Note: consider setting options.sync = true.
+    fn write(&self, options: &WriteOption, updates: Option<WriteBatch>) -> Result<()>;
 }

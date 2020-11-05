@@ -147,7 +147,7 @@ impl WriteBatch {
     }
 }
 
-trait Handler {
+pub trait Handler {
     fn put(&mut self, key: Slice, value: Slice);
     fn delete(&mut self, key: Slice);
 }

@@ -1,4 +1,5 @@
 use crate::db::error::{Result, StatusError};
+use crate::util::buffer::{BufferReader, BufferWriter};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 
 const B: u32 = 128;
@@ -40,6 +41,14 @@ pub trait EncodeVarint {
 pub trait DecodeVarint {
     fn decode_varint32(&mut self) -> Result<u32>;
     fn decode_varint64(&mut self) -> Result<u64>;
+}
+
+pub trait VarLengthSliceReader {
+    fn get_length_prefixed_slice(&mut self) -> Result<&[u8]>;
+}
+
+pub trait VarLengthSliceWriter {
+    fn put_length_prefixed_slice(&mut self, data: &[u8]) -> Result<()>;
 }
 
 impl EncodeVarint for &mut [u8] {
@@ -116,6 +125,20 @@ impl DecodeVarint for &[u8] {
         Err(StatusError::Corruption(
             "Error when decoding varint64".to_string(),
         ))
+    }
+}
+
+impl VarLengthSliceReader for &[u8] {
+    fn get_length_prefixed_slice(&mut self) -> Result<&[u8]> {
+        let len = self.decode_varint32()?;
+        self.read_bytes(len as usize)
+    }
+}
+
+impl VarLengthSliceWriter for &mut [u8] {
+    fn put_length_prefixed_slice(&mut self, data: &[u8]) -> Result<()> {
+        self.encode_varint32(data.len() as u32);
+        self.write_bytes(data)
     }
 }
 
