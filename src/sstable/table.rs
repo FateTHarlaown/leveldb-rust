@@ -12,9 +12,11 @@ use crate::sstable::format::{
 use crate::sstable::two_level_iterator::{BlockIterBuilder, TwoLevelIterator};
 use crate::util::cmp::{BitWiseComparator, Comparator};
 use byteorder::{LittleEndian, WriteBytesExt};
+use snap::write::FrameEncoder;
 use std::cmp::Ordering;
 use std::mem;
 use std::sync::Arc;
+use std::io;
 
 // A Table is a sorted map from strings to strings.  Tables are
 // immutable and persistent.  A Table may be safely accessed from
@@ -470,14 +472,16 @@ fn write_block<W: WritableFile>(
     let block_content = match write_compress_type {
         NO_COMPRESSION => raw,
         SNAPPY_COMPRESSION => {
-            mem::replace(compressed_out, snappy::compress(raw.as_ref()));
+            compressed_out.clear();
+            let mut encoder = FrameEncoder::new(compressed_out);
+            io::copy(&mut raw.as_ref(), &mut encoder)?;
             if compressed_out.len() < raw.size() - (raw.size() / 8) {
-                raw
+                compressed_out.as_slice().into()
             } else {
                 // Snappy not supported, or compressed less than 12.5%, so just
                 // store uncompressed form
                 write_compress_type = NO_COMPRESSION;
-                compressed_out.as_slice().into()
+                raw
             }
         }
 
