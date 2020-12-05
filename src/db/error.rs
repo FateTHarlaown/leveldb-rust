@@ -4,6 +4,7 @@ use crossbeam_channel::RecvError;
 use failure::_core::num::ParseIntError;
 use std::io;
 use std::result;
+use std::string::FromUtf8Error;
 
 pub type Result<T> = result::Result<T, StatusError>;
 
@@ -29,6 +30,9 @@ pub enum StatusError {
 
     #[fail(display = "{}", _0)]
     RecvError(RecvError),
+
+    #[fail(display = "{}", _0)]
+    UTF8Error(FromUtf8Error),
 }
 
 impl From<io::Error> for StatusError {
@@ -45,6 +49,12 @@ impl From<ParseIntError> for StatusError {
 
 impl From<RecvError> for StatusError {
     fn from(err: RecvError) -> Self {
-        StatusError::Corruption(err.to_string())
+        StatusError::RecvError(err)
+    }
+}
+
+impl From<FromUtf8Error> for StatusError {
+    fn from(err: FromUtf8Error) -> Self {
+        StatusError::UTF8Error(err)
     }
 }

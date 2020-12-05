@@ -6,17 +6,25 @@ use crate::db::dbformat::{TYPE_DELETION, TYPE_VALUE};
 use crate::db::error::{Result, StatusError};
 use crate::db::slice::Slice;
 use crate::db::table_cache::TableCache;
-use crate::db::ReadOption;
+use crate::db::{ReadOption, Reporter};
 
-use crate::env::Env;
+use crate::env::{read_file_to_vec, Env};
 use crate::util::cache::Cache;
 use crate::util::cmp::Comparator;
 
+use crate::db::filename::current_file_name;
+use crate::db::filename::FileType::CurrentFile;
+use crate::db::log::{LogReader, LogWriter};
+use crate::db::option::Options;
 use crate::util::buffer::BufferReader;
 use crate::util::coding::{put_varint32, put_varint64, DecodeVarint, VarLengthSliceReader};
+use failure::_core::cell::RefCell;
+use failure::_core::intrinsics::floorf32;
+use failure::_core::option::Option::Some;
 use std::cmp::Ordering;
+use std::collections::hash_set::Difference;
 use std::collections::linked_list::LinkedList;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::io::Write;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -49,14 +57,61 @@ enum GetState {
     Corrupt,
 }
 
+struct ReporterStatus(Option<StatusError>);
+
+#[derive(Clone)]
+struct LogReporter {
+    inner: Rc<RefCell<ReporterStatus>>,
+}
+
+impl LogReporter {
+    fn new() -> Self {
+        LogReporter {
+            inner: Rc::new(RefCell::new(ReporterStatus(None))),
+        }
+    }
+
+    fn result(&self) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        if inner.0.is_some() {
+            Err(inner.0.take().unwrap())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Reporter for LogReporter {
+    fn corruption(&mut self, n: usize, status: StatusError) {
+        let mut innner = self.inner.borrow_mut();
+        if innner.0.is_none() {
+            innner.0 = Some(status);
+        }
+    }
+}
+
 pub struct Version {
     // List of files per level
-    files: [Vec<Arc<FileMetaData>>; config::NUM_LEVELS],
+    files: Vec<Vec<Arc<FileMetaData>>>,
     file_to_compact: Option<Arc<FileMetaData>>,
     icmp: InternalKeyComparator,
+    compaction_score: f64,
+    compaction_level: i32,
 }
 
 impl Version {
+    pub fn new(icmp: InternalKeyComparator) -> Self {
+        let mut files = Vec::with_capacity(config::NUM_LEVELS);
+        files.resize(config::NUM_LEVELS, Vec::new());
+        Version {
+            files,
+            file_to_compact: None,
+            icmp,
+            compaction_score: -1f64,
+            compaction_level: -1,
+        }
+    }
+
     pub fn get<E: Env>(
         &self,
         option: &ReadOption,
@@ -171,12 +226,8 @@ impl Version {
             if self.files[i].is_empty() {
                 continue;
             }
-            let index = match self.files[i]
-                .binary_search_by(|f| self.icmp.compare(&f.largest.encode(), &internal_key))
-            {
-                Ok(index) => index,
-                Err(index) => index,
-            };
+
+            let index = find_file(&self.icmp, &self.files[i], internal_key);
             if index < self.files[i].len() {
                 let f = self.files[i][index].clone();
                 if ucmp.compare(&user_key, &f.smallest.user_key()) != Ordering::Less {
@@ -187,43 +238,47 @@ impl Version {
             }
         }
     }
+}
 
-    fn some_file_overlaps_range(
-        &self,
-        icmp: &InternalKeyComparator,
-        disjoint_sorted_files: bool,
-        files: &Vec<Arc<FileMetaData>>,
-        smallest: &Option<Slice>,
-        largest: &Option<Slice>,
-    ) -> bool {
-        let cmp = icmp.user_comparator();
-        if !disjoint_sorted_files {
-            // Need to check against all files
-            for file in files {
-                if before_file(cmp.clone(), largest, file)
-                    || after_file(cmp.clone(), smallest, file)
-                {
-                    // No overlap
-                    continue;
-                }
-                return true;
+fn find_file(icmp: &InternalKeyComparator, files: &Vec<Arc<FileMetaData>>, key: Slice) -> usize {
+    match files.binary_search_by(|f| icmp.compare(&f.largest.encode(), &key)) {
+        Ok(index) => index,
+        Err(index) => index,
+    }
+}
+
+fn some_file_overlaps_range(
+    icmp: &InternalKeyComparator,
+    disjoint_sorted_files: bool,
+    files: &Vec<Arc<FileMetaData>>,
+    smallest: &Option<Slice>,
+    largest: &Option<Slice>,
+) -> bool {
+    let cmp = icmp.user_comparator();
+    if !disjoint_sorted_files {
+        // Need to check against all files
+        for file in files {
+            if before_file(cmp.clone(), largest, file) || after_file(cmp.clone(), smallest, file) {
+                // No overlap
+                continue;
             }
+            return true;
+        }
+        false
+    } else {
+        // Binary search over file list
+        let mut index = 0;
+        if let Some(k) = smallest {
+            index = match files.binary_search_by(|f| cmp.compare(&f.largest.user_key(), &k)) {
+                Ok(index) => index,
+                Err(index) => index,
+            }
+        }
+
+        if index >= files.len() {
             false
         } else {
-            // Binary search over file list
-            let mut index = 0;
-            if let Some(k) = smallest {
-                index = match files.binary_search_by(|f| cmp.compare(&k, &f.largest.user_key())) {
-                    Ok(index) => index,
-                    Err(index) => index,
-                }
-            }
-
-            if index > files.len() {
-                false
-            } else {
-                !before_file(cmp, largest, &files[index])
-            }
+            !before_file(cmp, largest, &files[index])
         }
     }
 }
@@ -255,9 +310,24 @@ fn after_file(
 }
 
 pub struct VersionSet<E: Env> {
+    env: E,
     table_cache: TableCache<E>,
-    versions: LinkedList<Arc<Version>>,
+    options: Arc<Options>,
+    icmp: InternalKeyComparator,
     last_sequence: SequenceNumber,
+    next_file_number: u64,
+    manifest_file_number: u64,
+    log_number: u64,
+    prev_log_number: u64,
+    db_name: String,
+
+    descriptor_file: Option<E::WrFile>,
+    descriptor_log: Option<LogWriter<E::WrFile>>,
+    versions: LinkedList<Arc<Version>>,
+
+    // Per-level key at which the next compaction at that level should start.
+    // Either an empty string, or a valid InternalKey.
+    compact_pointer: Vec<Vec<u8>>,
 }
 
 impl<E: Env> VersionSet<E> {
@@ -271,6 +341,321 @@ impl<E: Env> VersionSet<E> {
 
     pub fn set_last_sequence(&mut self, n: SequenceNumber) {
         self.last_sequence = n;
+    }
+
+    // Return the current manifest file number
+    pub fn manifest_file_number(&mut self) -> u64 {
+        self.manifest_file_number
+    }
+
+    // Allocate and return a new file number
+    pub fn new_file_number(&mut self) -> u64 {
+        let ret = self.next_file_number;
+        self.next_file_number += 1;
+        ret
+    }
+
+    // Arrange to reuse "file_number" unless a newer file number has
+    // already been allocated.
+    // REQUIRES: "file_number" was returned by a call to NewFileNumber().
+    pub fn reuse_file_number(&mut self, file_number: u64) {
+        if self.next_file_number == file_number + 1 {
+            self.next_file_number = file_number;
+        }
+    }
+
+    pub fn mark_file_number_used(&mut self, number: u64) {
+        if self.next_file_number <= number {
+            self.next_file_number = number + 1;
+        }
+    }
+
+    pub fn recover(&mut self) -> Result<bool> {
+        let mut current: Vec<u8> = Vec::new();
+        read_file_to_vec(
+            self.env.clone(),
+            &current_file_name(&self.db_name),
+            &mut current,
+        )?;
+        let mut current_name = String::from_utf8(current)?;
+        if current_name.is_empty() || !current_name.ends_with("\n") {
+            return Err(StatusError::Corruption(
+                "CURRENT file does not end with newline".to_string(),
+            ));
+        }
+
+        current_name.truncate(current_name.len() - 1);
+        let mut dscname = String::from(self.db_name.as_str());
+        dscname.push('/');
+        dscname.push_str(current_name.as_str());
+
+        let mut file = self.env.new_sequential_file(&dscname)?;
+        let mut have_log_number = false;
+        let mut have_prev_log_number = false;
+        let mut have_next_file = false;
+        let mut have_last_sequence = false;
+        let mut next_file = 0;
+        let mut last_sequence = 0;
+        let mut log_number = 0;
+        let mut prev_log_number = 0;
+        let icmp = self.icmp.clone();
+        let mut builder = Builder::new(self.current(), icmp.clone());
+
+        let mut reporter = LogReporter::new();
+        let mut reader = LogReader::new(file, reporter.clone());
+        let mut record = Vec::new();
+        while reader.read_record(&mut record).is_ok() {
+            let mut edit = VersionEdit::default();
+            edit.decode_from(record.as_slice())?;
+            if edit.has_comparator && edit.comparator.as_str() == icmp.user_comparator().name() {
+                return Err(StatusError::InvalidArgument(format!(
+                    "{} does not match existing comparator {}",
+                    edit.comparator,
+                    icmp.user_comparator().name()
+                )));
+            }
+
+            builder.apply(&edit, &mut self.compact_pointer);
+
+            if edit.has_log_number {
+                log_number = edit.log_number;
+                have_log_number = true;
+            }
+
+            if edit.has_prev_log_number {
+                prev_log_number = edit.prev_log_number;
+                have_prev_log_number = true;
+            }
+
+            if edit.has_next_file_number {
+                next_file = edit.next_file_number;
+                have_next_file = true;
+            }
+
+            if edit.has_last_sequence {
+                last_sequence = edit.last_sequence;
+                have_last_sequence = true;
+            }
+        }
+
+        let mut res = reporter.result();
+        if res.is_ok() {
+            if !have_next_file {
+                res = Err(StatusError::Corruption(
+                    "no meta-nextfile entry in descriptor".to_string(),
+                ))
+            } else if !have_log_number {
+                res = Err(StatusError::Corruption(
+                    "no meta-lognumber entry in descriptor".to_string(),
+                ))
+            } else if have_last_sequence {
+                res = Err(StatusError::Corruption(
+                    "no last-sequence-number entry in descriptor".to_string(),
+                ))
+            }
+
+            if !have_prev_log_number {
+                prev_log_number = 0;
+            }
+
+            self.mark_file_number_used(prev_log_number);
+            self.mark_file_number_used(log_number);
+        }
+
+        if res.is_ok() {
+            let mut v = Version::new(icmp);
+            builder.save_to(&mut v);
+            // Install recovered version
+            self.finalize(&mut v);
+            self.versions.push_front(Arc::new(v));
+            self.manifest_file_number = next_file;
+            self.next_file_number = next_file + 1;
+            self.last_sequence = last_sequence;
+            self.log_number = log_number;
+            self.prev_log_number = prev_log_number;
+        }
+
+        if res.is_err() {
+            return Err(res.unwrap_err());
+        }
+
+        // See if we can reuse the existing MANIFEST file.
+        let mut save_manifest = false;
+        if self.reuse_manifest(&dscname, &current_name) {
+            save_manifest = true;
+        }
+
+        Ok(save_manifest)
+    }
+
+    fn reuse_manifest(&mut self, dscname: &String, dscbase: &String) -> bool {
+        false
+    }
+
+    fn finalize(&self, v: &mut Version) {
+        // Precomputed best level for next compaction
+        let mut best_level = -1;
+        let mut best_score = -1f64;
+        for level in 0..config::NUM_LEVELS - 1 {
+            let mut score = 0f64;
+            if level == 0 {
+                // We treat level-0 specially by bounding the number of files
+                // instead of number of bytes for two reasons:
+                //
+                // (1) With larger write-buffer sizes, it is nice not to do too
+                // many level-0 compactions.
+                //
+                // (2) The files in level-0 are merged on every read and
+                // therefore we wish to avoid too many files when the individual
+                // file size is small (perhaps because of a small write-buffer
+                // setting, or very high compression ratios, or lots of
+                // overwrites/deletions).
+                score = (v.files.len() / config::L0_COMPACTION_TRIGGER) as f64;
+            } else {
+                let level_bytes = total_size(&v.files[level]);
+                score = level_bytes as f64 / max_bytes_for_level(level);
+            }
+
+            if score > best_score {
+                best_score = score;
+                best_level = level as i32;
+            }
+        }
+
+        v.compaction_level = best_level;
+        v.compaction_score = best_score;
+    }
+}
+
+fn total_size(files: &Vec<Arc<FileMetaData>>) -> u64 {
+    let mut sum = 0;
+    files.iter().for_each(|f| sum += f.file_size);
+    sum
+}
+
+fn max_bytes_for_level(mut level: usize) -> f64 {
+    // Note: the result for level zero is not really used since we set
+    // the level-0 compaction threshold based on number of files.
+
+    // Result for both level-0 and level-1
+    let mut result = 10f64 * 1048576.0f64;
+    while level > 1 {
+        result *= 10f64;
+        level -= 1;
+    }
+
+    result
+}
+
+struct Builder {
+    base: Arc<Version>,
+    icmp: InternalKeyComparator,
+    deleted_files: Vec<HashSet<u64>>,
+    added_files: Vec<Vec<Arc<FileMetaData>>>,
+}
+
+impl Builder {
+    fn new(base: Arc<Version>, icmp: InternalKeyComparator) -> Self {
+        let mut deleted_files = Vec::with_capacity(config::NUM_LEVELS);
+        for _ in 0..config::NUM_LEVELS {
+            deleted_files.push(HashSet::new())
+        }
+        let mut added_files = Vec::with_capacity(config::NUM_LEVELS);
+        for _ in 0..config::NUM_LEVELS {
+            added_files.push(Vec::new())
+        }
+
+        Builder {
+            base,
+            icmp,
+            deleted_files,
+            added_files,
+        }
+    }
+
+    fn apply(&mut self, edit: &VersionEdit, compact_pointers: &mut Vec<Vec<u8>>) {
+        for (level, key) in edit.compact_pointers.iter() {
+            let v = &mut compact_pointers[*level as usize];
+            v.clear();
+            v.extend_from_slice(key.encode().as_ref());
+        }
+
+        for (level, f) in edit.deleted_files.iter() {
+            let deleted = &mut self.deleted_files[*level as usize];
+            deleted.insert(*f);
+        }
+
+        for (level, file) in edit.new_files.iter() {
+            let mut f = file.clone();
+            // We arrange to automatically compact this file after
+            // a certain number of seeks.  Let's assume:
+            //   (1) One seek costs 10ms
+            //   (2) Writing or reading 1MB costs 10ms (100MB/s)
+            //   (3) A compaction of 1MB does 25MB of IO:
+            //         1MB read from this level
+            //         10-12MB read from next level (boundaries may be misaligned)
+            //         10-12MB written to next level
+            // This implies that 25 seeks cost the same as the compaction
+            // of 1MB of data.  I.e., one seek costs approximately the
+            // same as the compaction of 40KB of data.  We are a little
+            // conservative and allow approximately one seek for every 16KB
+            // of data before triggering a compaction.
+            f.allowed_seeks = (f.file_size / 16384) as i32;
+            if f.allowed_seeks < 100 {
+                f.allowed_seeks = 100;
+            }
+
+            self.deleted_files[*level as usize].remove(&f.number);
+            let a = &mut self.added_files[*level as usize];
+            a.push(Arc::new(f));
+        }
+    }
+
+    fn save_to(&mut self, v: &mut Version) {
+        let cmp = self.icmp.clone();
+        for x in self.added_files.iter_mut() {
+            x.sort_by(|f1, f2| cmp.compare(&f1.smallest.encode(), &f2.smallest.encode()))
+        }
+
+        for level in 0..config::NUM_LEVELS {
+            // Merge the set of added files with the set of pre-existing files.
+            // Drop any deleted files.  Store the result in *v.
+            let base_files = &self.base.files[level];
+            let (mut add_iter, mut base_iter) = (
+                self.added_files[level].iter().peekable(),
+                base_files.iter().peekable(),
+            );
+            while let Some(add_file) = add_iter.next() {
+                while let Some(&base_file) = base_iter.peek() {
+                    if cmp.compare(&base_file.smallest.encode(), &add_file.smallest.encode())
+                        == Ordering::Less
+                    {
+                        self.maybe_add_file(v, level, base_file.clone());
+                        base_iter.next();
+                    } else {
+                        break;
+                    }
+                }
+                self.maybe_add_file(v, level, add_file.clone());
+            }
+            base_iter.for_each(|f| self.maybe_add_file(v, level, f.clone()));
+        }
+    }
+
+    fn maybe_add_file(&self, v: &mut Version, level: usize, f: Arc<FileMetaData>) {
+        // if file is deleted, do nothing
+        if !self.deleted_files[level].contains(&f.number) {
+            let last = &mut v.files[level].last();
+            if level != 0 && last.is_some() {
+                let last = last.unwrap();
+                assert_eq!(
+                    self.icmp
+                        .compare(&last.largest.encode(), &f.smallest.encode()),
+                    Ordering::Less
+                );
+            }
+            v.files[level].push(f)
+        }
     }
 }
 
@@ -580,7 +965,161 @@ fn get_internal_key(src: &mut &[u8], dst: &mut InternalKey) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use failure::_core::hint::unreachable_unchecked;
+    use crate::util::cmp::BitWiseComparator;
+    use std::io::Read;
+
+    struct FindFileTest {
+        disjoint_sorted_files: bool,
+        files: Vec<Arc<FileMetaData>>,
+    }
+
+    impl FindFileTest {
+        fn new() -> Self {
+            FindFileTest {
+                disjoint_sorted_files: true,
+                files: Vec::new(),
+            }
+        }
+
+        fn add(
+            &mut self,
+            smallest: Slice,
+            largest: Slice,
+            smallest_seq: SequenceNumber,
+            largest_seq: SequenceNumber,
+        ) {
+            let mut f = FileMetaData::default();
+            f.smallest = InternalKey::new(smallest, smallest_seq, TYPE_VALUE);
+            f.largest = InternalKey::new(largest, largest_seq, TYPE_VALUE);
+
+            self.files.push(Arc::new(f));
+        }
+
+        fn find(&self, key: Slice) -> usize {
+            let target = InternalKey::new(key, 100, TYPE_VALUE);
+            let cmp = InternalKeyComparator::new(Rc::new(BitWiseComparator {}));
+            find_file(&cmp, &self.files, target.encode())
+        }
+
+        fn overlaps(&self, smallest: Option<Slice>, largest: Option<Slice>) -> bool {
+            let cmp = InternalKeyComparator::new(Rc::new(BitWiseComparator {}));
+            some_file_overlaps_range(
+                &cmp,
+                self.disjoint_sorted_files,
+                &self.files,
+                &smallest,
+                &largest,
+            )
+        }
+    }
+
+    #[test]
+    fn test_find_file_empty() {
+        let tester = FindFileTest::new();
+        assert_eq!(0, tester.find("foo".into()));
+        assert!(!tester.overlaps(Some("a".into()), Some("z".into())));
+        assert!(!tester.overlaps(None, Some("z".into())));
+        assert!(!tester.overlaps(Some("a".into()), None));
+        assert!(!tester.overlaps(None, None));
+    }
+
+    #[test]
+    fn test_find_file_single() {
+        let mut tester = FindFileTest::new();
+        tester.add("p".into(), "q".into(), 100, 100);
+        assert_eq!(0, tester.find("a".into()));
+        assert_eq!(0, tester.find("p".into()));
+        assert_eq!(0, tester.find("p1".into()));
+        assert_eq!(0, tester.find("q".into()));
+        assert_eq!(1, tester.find("q1".into()));
+        assert_eq!(1, tester.find("z".into()));
+
+        assert!(!tester.overlaps(Some("a".into()), Some("b".into())));
+        assert!(!tester.overlaps(Some("z1".into()), Some("z2".into())));
+        assert!(tester.overlaps(Some("a".into()), Some("p".into())));
+        assert!(tester.overlaps(Some("a".into()), Some("q".into())));
+        assert!(tester.overlaps(Some("a".into()), Some("z".into())));
+        assert!(tester.overlaps(Some("p".into()), Some("p1".into())));
+        assert!(tester.overlaps(Some("p".into()), Some("q".into())));
+        assert!(tester.overlaps(Some("p".into()), Some("z".into())));
+        assert!(tester.overlaps(Some("p1".into()), Some("p2".into())));
+        assert!(tester.overlaps(Some("p1".into()), Some("z".into())));
+        assert!(tester.overlaps(Some("q".into()), Some("q".into())));
+        assert!(tester.overlaps(Some("q".into()), Some("q1".into())));
+
+        assert!(!tester.overlaps(None, Some("j".into())));
+        assert!(!tester.overlaps(Some("r".into()), None));
+        assert!(tester.overlaps(None, Some("p".into())));
+        assert!(tester.overlaps(None, Some("p1".into())));
+        assert!(tester.overlaps(Some("q".into()), None));
+        assert!(tester.overlaps(None, None));
+    }
+
+    #[test]
+    fn test_find_file_multiple() {
+        let mut tester = FindFileTest::new();
+        tester.add("150".into(), "200".into(), 100, 100);
+        tester.add("200".into(), "250".into(), 100, 100);
+        tester.add("300".into(), "350".into(), 100, 100);
+        tester.add("400".into(), "450".into(), 100, 100);
+
+        assert_eq!(0, tester.find("100".into()));
+        assert_eq!(0, tester.find("150".into()));
+        assert_eq!(0, tester.find("151".into()));
+        assert_eq!(0, tester.find("199".into()));
+        assert_eq!(0, tester.find("200".into()));
+        assert_eq!(1, tester.find("201".into()));
+        assert_eq!(1, tester.find("249".into()));
+        assert_eq!(1, tester.find("250".into()));
+        assert_eq!(2, tester.find("251".into()));
+        assert_eq!(2, tester.find("299".into()));
+        assert_eq!(2, tester.find("300".into()));
+        assert_eq!(2, tester.find("349".into()));
+        assert_eq!(2, tester.find("350".into()));
+        assert_eq!(3, tester.find("351".into()));
+        assert_eq!(3, tester.find("400".into()));
+        assert_eq!(3, tester.find("450".into()));
+        assert_eq!(4, tester.find("451".into()));
+
+        assert!(!tester.overlaps(Some("100".into()), Some("149".into())));
+        assert!(!tester.overlaps(Some("251".into()), Some("299".into())));
+        assert!(!tester.overlaps(Some("451".into()), Some("500".into())));
+        assert!(!tester.overlaps(Some("351".into()), Some("399".into())));
+
+        assert!(tester.overlaps(Some("100".into()), Some("150".into())));
+        assert!(tester.overlaps(Some("100".into()), Some("200".into())));
+        assert!(tester.overlaps(Some("100".into()), Some("300".into())));
+        assert!(tester.overlaps(Some("100".into()), Some("400".into())));
+        assert!(tester.overlaps(Some("100".into()), Some("500".into())));
+        assert!(tester.overlaps(Some("375".into()), Some("400".into())));
+        assert!(tester.overlaps(Some("450".into()), Some("450".into())));
+        assert!(tester.overlaps(Some("450".into()), Some("500".into())));
+    }
+
+    #[test]
+    fn test_find_file_multiple_null_boundaries() {
+        let mut tester = FindFileTest::new();
+        tester.add("150".into(), "200".into(), 100, 100);
+        tester.add("200".into(), "250".into(), 100, 100);
+        tester.add("300".into(), "350".into(), 100, 100);
+        tester.add("400".into(), "450".into(), 100, 100);
+
+        assert!(!tester.overlaps(None, Some("149".into())));
+        assert!(!tester.overlaps(Some("451".into()), None));
+        assert!(tester.overlaps(None, None));
+        assert!(tester.overlaps(None, Some("150".into())));
+        assert!(tester.overlaps(None, Some("150".into())));
+        assert!(tester.overlaps(None, Some("199".into())));
+        assert!(tester.overlaps(None, Some("200".into())));
+        assert!(tester.overlaps(None, Some("201".into())));
+        assert!(tester.overlaps(None, Some("400".into())));
+        assert!(tester.overlaps(None, Some("800".into())));
+
+        assert!(tester.overlaps(Some("100".into()), None));
+        assert!(tester.overlaps(Some("200".into()), None));
+        assert!(tester.overlaps(Some("449".into()), None));
+        assert!(tester.overlaps(Some("450".into()), None));
+    }
 
     fn encode_decode(edit: &VersionEdit) {
         let mut encoded = Vec::new();

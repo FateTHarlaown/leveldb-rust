@@ -91,3 +91,19 @@ pub fn write_string_to_file_sync<E: Env>(env: E, data: &[u8], file_name: &String
     }
     ret
 }
+
+pub fn read_file_to_vec<E: Env>(env: E, fname: &String, data: &mut Vec<u8>) -> Result<()> {
+    data.clear();
+    let mut f = env.new_sequential_file(fname)?;
+    let buf_len = 8192;
+    let mut buf = Vec::with_capacity(buf_len);
+    loop {
+        let n = f.read(buf.as_mut_slice(), buf_len)?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf.as_slice()[0..n]);
+    }
+
+    Ok(())
+}

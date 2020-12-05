@@ -15,9 +15,9 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use snap::write::FrameEncoder;
 use std::cmp::Ordering;
 use std::io;
+use std::io::Write;
 use std::mem;
 use std::sync::Arc;
-use std::io::Write;
 
 // A Table is a sorted map from strings to strings.  Tables are
 // immutable and persistent.  A Table may be safely accessed from

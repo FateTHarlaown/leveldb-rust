@@ -51,6 +51,12 @@ impl<'a> From<&'a [u8]> for Slice {
     }
 }
 
+impl From<&str> for Slice {
+    fn from(s: &str) -> Self {
+        s.as_bytes().into()
+    }
+}
+
 impl Default for Slice {
     fn default() -> Self {
         Slice {

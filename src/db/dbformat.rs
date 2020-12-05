@@ -157,6 +157,7 @@ impl Default for InternalKey {
     }
 }
 
+#[derive(Clone)]
 pub struct InternalKeyComparator {
     user_comparator: Rc<dyn Comparator<Slice>>,
 }
