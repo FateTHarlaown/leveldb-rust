@@ -5,8 +5,8 @@ use crate::db::{RandomAccessFile, ReadOption};
 use crate::util::coding::{put_varint64, DecodeVarint};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use snap::read::FrameDecoder;
-use std::mem;
 use std::io;
+use std::mem;
 
 // Maximum encoding length of a BlockHandle
 pub const BLOCK_HANDLE_MAX_ENCODED_LENGTH: usize = 10 + 10;
@@ -194,9 +194,8 @@ impl BlockContent {
             }
             SNAPPY_COMPRESSION => {
                 let mut uncompressed_data = Vec::new();
-                let mut reader = FrameDecoder::new(data[0..n]);
-                io::copy(&mut reader, &mut uncompressed_data)?;
-                if let Ok(uncompressed_data) = uncompress(data) {
+                let mut reader = FrameDecoder::new(&data[0..n]);
+                if io::copy(&mut reader, &mut uncompressed_data).is_ok() {
                     block.data = uncompressed_data;
                     block.heap_allocted = true;
                     block.cachable = true;
