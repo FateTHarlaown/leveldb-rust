@@ -474,9 +474,10 @@ fn write_block<W: WritableFile>(
         NO_COMPRESSION => raw,
         SNAPPY_COMPRESSION => {
             compressed_out.clear();
-            let mut encoder = FrameEncoder::new(&mut (*compressed_out));
-            io::copy(&mut raw.as_ref(), &mut encoder)?;
-            mem::drop(encoder);
+            {
+                let mut encoder = FrameEncoder::new(&mut (*compressed_out));
+                io::copy(&mut raw.as_ref(), &mut encoder)?;
+            }
             if compressed_out.len() < raw.size() - (raw.size() / 8) {
                 compressed_out.as_slice().into()
             } else {
