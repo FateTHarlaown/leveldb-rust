@@ -1121,6 +1121,37 @@ mod tests {
         assert!(tester.overlaps(Some("450".into()), None));
     }
 
+    #[test]
+    fn test_find_file_overlap_sequence_checks() {
+        let mut tester = FindFileTest::new();
+        tester.add("200".into(), "200".into(), 5000, 3000);
+        assert!(!tester.overlaps(Some("199".into()), Some("199".into())));
+        assert!(!tester.overlaps(Some("201".into()), Some("300".into())));
+        assert!(tester.overlaps(Some("200".into()), Some("200".into())));
+        assert!(tester.overlaps(Some("190".into()), Some("200".into())));
+        assert!(tester.overlaps(Some("200".into()), Some("210".into())));
+    }
+
+    #[test]
+    fn test_find_file_overlapping_files() {
+        let mut tester = FindFileTest::new();
+        tester.add("150".into(), "600".into(), 100, 100);
+        tester.add("400".into(), "500".into(), 100, 100);
+        tester.disjoint_sorted_files = false;
+        assert!(!tester.overlaps(Some("100".into()), Some("149".into())));
+        assert!(!tester.overlaps(Some("601".into()), Some("700".into())));
+        assert!(tester.overlaps(Some("100".into()), Some("150".into())));
+        assert!(tester.overlaps(Some("100".into()), Some("200".into())));
+        assert!(tester.overlaps(Some("100".into()), Some("300".into())));
+        assert!(tester.overlaps(Some("100".into()), Some("400".into())));
+        assert!(tester.overlaps(Some("100".into()), Some("500".into())));
+        assert!(tester.overlaps(Some("375".into()), Some("400".into())));
+        assert!(tester.overlaps(Some("450".into()), Some("450".into())));
+        assert!(tester.overlaps(Some("450".into()), Some("500".into())));
+        assert!(tester.overlaps(Some("450".into()), Some("700".into())));
+        assert!(tester.overlaps(Some("600".into()), Some("700".into())));
+    }
+
     fn encode_decode(edit: &VersionEdit) {
         let mut encoded = Vec::new();
         let mut encoded2 = Vec::new();
