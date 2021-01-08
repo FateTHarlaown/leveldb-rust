@@ -15,6 +15,7 @@ rand = "0.7.2"
 snap = "1"
 lru = "0.5.0"
 crossbeam-channel = "0.4"
+crossbeam-utils = "0.8.1"
 
 #[features]
 #debug = ["true"]

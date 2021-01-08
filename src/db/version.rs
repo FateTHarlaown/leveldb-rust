@@ -1,6 +1,6 @@
 use crate::db::dbformat::{
     config, parse_internal_key, InternalKey, InternalKeyComparator, LookupKey, ParsedInternalKey,
-    SequenceNumber,
+    SequenceNumber, MAX_SEQUENCE_NUMBER, VALUE_TYPE_FOR_SEEK,
 };
 use crate::db::dbformat::{TYPE_DELETION, TYPE_VALUE};
 use crate::db::error::{Result, StatusError};
@@ -12,15 +12,14 @@ use crate::env::{read_file_to_vec, Env};
 use crate::util::cache::Cache;
 use crate::util::cmp::Comparator;
 
-use crate::db::filename::current_file_name;
+use crate::db::filename::{current_file_name, descriptor_file_name, set_current_file};
 use crate::db::filename::FileType::CurrentFile;
 use crate::db::log::{LogReader, LogWriter};
 use crate::db::option::Options;
 use crate::util::buffer::BufferReader;
 use crate::util::coding::{put_varint32, put_varint64, DecodeVarint, VarLengthSliceReader};
-use failure::_core::cell::RefCell;
-use failure::_core::intrinsics::floorf32;
-use failure::_core::option::Option::Some;
+
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::hash_set::Difference;
 use std::collections::linked_list::LinkedList;
@@ -31,11 +30,35 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct FileMetaData {
-    allowed_seeks: i32,
-    number: u64,
-    file_size: u64,
-    smallest: InternalKey,
-    largest: InternalKey,
+    pub allowed_seeks: i32,
+    pub number: u64,
+    pub file_size: u64,
+    pub smallest: InternalKey,
+    pub largest: InternalKey,
+}
+
+pub struct CompactionState {
+    pub micros: u64,
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+}
+
+impl CompactionState {
+    pub fn add(&mut self, c: &CompactionState) {
+        self.micros += c.micros;
+        self.bytes_read += c.bytes_read;
+        self.bytes_written += c.bytes_written;
+    }
+}
+
+impl Default for CompactionState {
+    fn default() -> Self {
+        CompactionState {
+            micros: 0,
+            bytes_read: 0,
+            bytes_written: 0,
+        }
+    }
 }
 
 impl Default for FileMetaData {
@@ -90,8 +113,10 @@ impl Reporter for LogReporter {
     }
 }
 
-pub struct Version {
+pub struct Version<E: Env> {
     // List of files per level
+    table_cache: TableCache<E>,
+    options: Arc<Options>,
     files: Vec<Vec<Arc<FileMetaData>>>,
     file_to_compact: Option<Arc<FileMetaData>>,
     icmp: InternalKeyComparator,
@@ -99,11 +124,17 @@ pub struct Version {
     compaction_level: i32,
 }
 
-impl Version {
-    pub fn new(icmp: InternalKeyComparator) -> Self {
+impl<E: Env> Version<E> {
+    pub fn new(
+        icmp: InternalKeyComparator,
+        options: Arc<Options>,
+        table_cache: TableCache<E>,
+    ) -> Self {
         let mut files = Vec::with_capacity(config::NUM_LEVELS);
         files.resize(config::NUM_LEVELS, Vec::new());
         Version {
+            table_cache,
+            options,
             files,
             file_to_compact: None,
             icmp,
@@ -112,7 +143,7 @@ impl Version {
         }
     }
 
-    pub fn get<E: Env>(
+    pub fn get(
         &self,
         option: &ReadOption,
         k: &LookupKey,
@@ -206,7 +237,7 @@ impl Version {
         let mut tmp = Vec::with_capacity(self.files[0].len());
         self.files[0].iter().for_each(|f| {
             let cmp_small = ucmp.compare(&user_key, &f.smallest.user_key());
-            let cmp_big = ucmp.compare(&user_key, &f.smallest.user_key());
+            let cmp_big = ucmp.compare(&user_key, &f.largest.user_key());
             if (cmp_small == Ordering::Equal || cmp_small == Ordering::Greater)
                 && (cmp_big == Ordering::Less || cmp_big == Ordering::Equal)
             {
@@ -238,6 +269,97 @@ impl Version {
             }
         }
     }
+
+    pub fn overlap_in_level(
+        &self,
+        level: usize,
+        smallest: &Option<Slice>,
+        largest: &Option<Slice>,
+    ) -> bool {
+        some_file_overlaps_range(&self.icmp, level > 0, &self.files[level], smallest, largest)
+    }
+
+    pub fn get_overlapping_inputs(
+        &self,
+        level: usize,
+        begin: &Option<InternalKey>,
+        end: &Option<InternalKey>,
+        input: &mut Vec<Arc<FileMetaData>>,
+    ) {
+        assert!(level < config::NUM_LEVELS);
+        input.clear();
+
+        let user_cmp = self.icmp.user_comparator();
+        let mut user_begin = begin.as_ref().map(|k| k.user_key());
+        let mut user_end = end.as_ref().map(|k| k.user_key());
+        let mut i = 0;
+        while i < self.files[level].len() {
+            let f = &self.files[level][i];
+            i += 1;
+            if !before_file(&user_cmp, &user_end, f) && !after_file(&user_cmp, &user_begin, f) {
+                input.push(f.clone());
+                if level == 0 {
+                    // Level-0 files may overlap each other.  So check if the newly
+                    // added file has expanded the range.  If so, restart search.
+                    if begin.is_some()
+                        && user_cmp.compare(&f.smallest.user_key(), user_begin.as_ref().unwrap())
+                            == Ordering::Less
+                    {
+                        i = 0;
+                        input.clear();
+                        user_begin = user_begin.map(|_| f.smallest.user_key());
+                    } else if end.is_some()
+                        && user_cmp.compare(&f.largest.user_key(), user_end.as_ref().unwrap())
+                            == Ordering::Greater
+                    {
+                        i = 0;
+                        input.clear();
+                        user_end = user_end.map(|_| f.largest.user_key());
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn pick_level_for_memtable_output(
+        &self,
+        smallest_user_key: &Option<Slice>,
+        largest_user_key: &Option<Slice>,
+    ) -> usize {
+        let mut level = 0;
+        if !self.overlap_in_level(0, smallest_user_key, largest_user_key) {
+            // Push to next level if there is no overlap in next level,
+            // and the #bytes overlapping in the level after that are limited.
+            let start = smallest_user_key
+                .as_ref()
+                .map(|s| InternalKey::new(s.clone(), MAX_SEQUENCE_NUMBER, VALUE_TYPE_FOR_SEEK));
+            let limit = smallest_user_key
+                .as_ref()
+                .map(|s| InternalKey::new(s.clone(), 0, 0));
+            let mut overlaps = Vec::new();
+            while level < config::MAX_MEM_COMPACT_LEVEL {
+                if self.overlap_in_level(level + 1, smallest_user_key, largest_user_key) {
+                    break;
+                }
+
+                if level + 2 < config::NUM_LEVELS {
+                    self.get_overlapping_inputs(level + 2, &start, &limit, &mut overlaps);
+                    let sum = total_size(&overlaps);
+                    if sum > grand_parent_overlap_bytes(&self.options) as u64 {
+                        break;
+                    }
+                }
+
+                level += 1;
+            }
+        }
+
+        level
+    }
+}
+
+fn grand_parent_overlap_bytes(options: &Arc<Options>) -> usize {
+    10 * target_file_size(options)
 }
 
 fn find_file(icmp: &InternalKeyComparator, files: &Vec<Arc<FileMetaData>>, key: Slice) -> usize {
@@ -258,7 +380,7 @@ fn some_file_overlaps_range(
     if !disjoint_sorted_files {
         // Need to check against all files
         for file in files {
-            if before_file(cmp.clone(), largest, file) || after_file(cmp.clone(), smallest, file) {
+            if before_file(&cmp, largest, file) || after_file(&cmp, smallest, file) {
                 // No overlap
                 continue;
             }
@@ -278,13 +400,13 @@ fn some_file_overlaps_range(
         if index >= files.len() {
             false
         } else {
-            !before_file(cmp, largest, &files[index])
+            !before_file(&cmp, largest, &files[index])
         }
     }
 }
 
 fn before_file(
-    ucmp: Rc<dyn Comparator<Slice>>,
+    ucmp: &Arc<dyn Comparator<Slice>>,
     user_key: &Option<Slice>,
     file: &Arc<FileMetaData>,
 ) -> bool {
@@ -296,7 +418,7 @@ fn before_file(
 }
 
 fn after_file(
-    ucmp: Rc<dyn Comparator<Slice>>,
+    ucmp: &Arc<dyn Comparator<Slice>>,
     user_key: &Option<Slice>,
     file: &Arc<FileMetaData>,
 ) -> bool {
@@ -309,8 +431,23 @@ fn after_file(
     }
 }
 
+fn total_file_size(files: &Vec<Arc<FileMetaData>>) -> u64 {
+    let mut sum = 0;
+    files.iter().for_each(|f| sum += f.file_size);
+    sum
+}
+
+fn max_grand_parent_overlap_bytes(options: &Arc<Options>) -> usize {
+    10 * target_file_size(options)
+}
+
+fn target_file_size(options: &Arc<Options>) -> usize {
+    options.max_file_size
+}
+
 pub struct VersionSet<E: Env> {
     env: E,
+    db_name: String,
     table_cache: TableCache<E>,
     options: Arc<Options>,
     icmp: InternalKeyComparator,
@@ -319,19 +456,60 @@ pub struct VersionSet<E: Env> {
     manifest_file_number: u64,
     log_number: u64,
     prev_log_number: u64,
-    db_name: String,
 
-    descriptor_file: Option<E::WrFile>,
-    descriptor_log: Option<LogWriter<E::WrFile>>,
-    versions: LinkedList<Arc<Version>>,
+    versions: LinkedList<Arc<Version<E>>>,
 
     // Per-level key at which the next compaction at that level should start.
     // Either an empty string, or a valid InternalKey.
     compact_pointer: Vec<Vec<u8>>,
+    // manifest log for version_set
+    descriptor_log: Option<LogWriter<E::WrFile>>,
+
+    pub pending_outputs: HashSet<u64>,
+    pub stats: Vec<CompactionState>,
 }
 
 impl<E: Env> VersionSet<E> {
-    pub fn current(&self) -> Arc<Version> {
+    pub fn new(
+        env: E,
+        db_name: String,
+        options: Arc<Options>,
+        table_cache: TableCache<E>,
+        icmp: InternalKeyComparator,
+    ) -> Self {
+        let mut compact_pointer = Vec::with_capacity(config::NUM_LEVELS);
+        let mut stats = Vec::with_capacity(config::NUM_LEVELS);
+        for _ in 0..config::NUM_LEVELS {
+            compact_pointer.push(Vec::new());
+            stats.push(CompactionState::default());
+        }
+        let mut version_set = VersionSet {
+            env,
+            db_name,
+            table_cache,
+            options,
+            icmp,
+            next_file_number: 2,
+            last_sequence: 0,
+            log_number: 0,
+            prev_log_number: 0,
+            manifest_file_number: 0,
+            descriptor_log: None,
+            versions: LinkedList::new(),
+            compact_pointer,
+            pending_outputs: HashSet::new(),
+            stats,
+        };
+
+        let v = Version::new(
+            version_set.icmp.clone(),
+            version_set.options.clone(),
+            version_set.table_cache.clone(),
+        );
+        version_set.versions.push_front(Arc::new(v));
+        version_set
+    }
+    pub fn current(&self) -> Arc<Version<E>> {
         self.versions.front().unwrap().clone()
     }
 
@@ -368,6 +546,14 @@ impl<E: Env> VersionSet<E> {
         if self.next_file_number <= number {
             self.next_file_number = number + 1;
         }
+    }
+
+    pub fn log_number(&self) -> u64 {
+        self.log_number
+    }
+
+    pub fn prev_log_number(&self) -> u64 {
+        self.prev_log_number
     }
 
     pub fn recover(&mut self) -> Result<bool> {
@@ -463,7 +649,7 @@ impl<E: Env> VersionSet<E> {
         }
 
         if res.is_ok() {
-            let mut v = Version::new(icmp);
+            let mut v = Version::new(icmp, self.options.clone(), self.table_cache.clone());
             builder.save_to(&mut v);
             // Install recovered version
             self.finalize(&mut v);
@@ -492,7 +678,7 @@ impl<E: Env> VersionSet<E> {
         false
     }
 
-    fn finalize(&self, v: &mut Version) {
+    fn finalize(&self, v: &mut Version<E>) {
         // Precomputed best level for next compaction
         let mut best_level = -1;
         let mut best_score = -1f64;
@@ -525,6 +711,100 @@ impl<E: Env> VersionSet<E> {
         v.compaction_level = best_level;
         v.compaction_score = best_score;
     }
+
+    pub fn add_live_files(&self, live: &mut HashSet<u64>) {
+        for v in self.versions.iter() {
+            for level in v.files.iter() {
+                for f in level.iter() {
+                    live.insert(f.number);
+                }
+            }
+        }
+    }
+
+    pub fn log_and_apply(&mut self, edit: &mut VersionEdit) -> Result<()> {
+        if edit.has_log_number {
+            assert!(edit.log_number >= self.log_number);
+            assert!(edit.log_number < self.next_file_number);
+        } else {
+            edit.set_prev_log_number(self.log_number);
+        }
+
+        if !edit.has_prev_log_number {
+            edit.set_prev_log_number(self.prev_log_number);
+        }
+
+        edit.set_next_file(self.next_file_number);
+        edit.set_last_sequence(self.prev_log_number);
+
+        let mut v = Version::new(self.icmp.clone(), self.options.clone(), self.table_cache.clone());
+        let mut builder = Builder::new(self.current(), self.icmp.clone());
+        builder.apply(edit, &mut self.compact_pointer);
+        builder.save_to(&mut v);
+        self.finalize(&mut v);
+
+        // Initialize new descriptor log file if necessary by creating
+        // a temporary file that contains a snapshot of the current version.
+        let mut create_new_manifest = false;
+        if self.descriptor_log.is_none() {
+            create_new_manifest = true;
+            let manifest_name = descriptor_file_name(&self.db_name, self.manifest_file_number);
+            let manifest_file = self.env.new_writable_file(&manifest_name)?;
+            let mut writer = LogWriter::new(manifest_file);
+            match self.write_snapshot(&mut writer) {
+                Ok(_) => self.descriptor_log = Some(writer),
+                Err(e) => {
+                    self.env.delete_file(&manifest_name)?;
+                    return Err(e);
+                }
+            }
+
+        }
+
+        // Write new record to MANIFEST log
+        let mut record = Vec::new();
+        edit.encode_to(&mut record);
+        let mut writer = self.descriptor_log.as_mut().unwrap();
+        writer.add_record(record.as_slice())?;
+        writer.sync()?;
+
+        // If we just created a new descriptor file, install it by writing a
+        // new CURRENT file that points to it.
+        if create_new_manifest {
+            set_current_file(self.env.clone(), &self.db_name, self.manifest_file_number)?;
+        }
+
+        self.versions.push_front(Arc::new(v));
+
+        Ok(())
+    }
+
+    fn write_snapshot(&self, writer: &mut LogWriter<E::WrFile>) -> Result<()> {
+
+        // Save metadata
+        let mut edit = VersionEdit::default();
+        edit.set_comparator_name(&self.icmp.user_comparator().name().to_string());
+
+        // Save compaction pointers
+        for (i,c) in self.compact_pointer.iter().enumerate() {
+            if !c.is_empty() {
+                let mut key = InternalKey::new_empty_key();
+                key.decode_from(c.as_slice().into());
+                edit.set_compact_pointer(i as u32, key);
+            }
+        }
+
+        // Save files
+        for (i, files) in self.current().files.iter().enumerate() {
+            for f in files.iter() {
+                edit.add_file(i as u32, f.number, f.file_size, f.smallest.clone(), f.largest.clone());
+            }
+        }
+
+        let mut record = Vec::new();
+        edit.encode_to(&mut record);
+        writer.add_record(record.as_slice())
+    }
 }
 
 fn total_size(files: &Vec<Arc<FileMetaData>>) -> u64 {
@@ -547,15 +827,15 @@ fn max_bytes_for_level(mut level: usize) -> f64 {
     result
 }
 
-struct Builder {
-    base: Arc<Version>,
+struct Builder<E: Env> {
+    base: Arc<Version<E>>,
     icmp: InternalKeyComparator,
     deleted_files: Vec<HashSet<u64>>,
     added_files: Vec<Vec<Arc<FileMetaData>>>,
 }
 
-impl Builder {
-    fn new(base: Arc<Version>, icmp: InternalKeyComparator) -> Self {
+impl<E: Env> Builder<E> {
+    fn new(base: Arc<Version<E>>, icmp: InternalKeyComparator) -> Self {
         let mut deleted_files = Vec::with_capacity(config::NUM_LEVELS);
         for _ in 0..config::NUM_LEVELS {
             deleted_files.push(HashSet::new())
@@ -611,7 +891,7 @@ impl Builder {
         }
     }
 
-    fn save_to(&mut self, v: &mut Version) {
+    fn save_to(&mut self, v: &mut Version<E>) {
         let cmp = self.icmp.clone();
         for x in self.added_files.iter_mut() {
             x.sort_by(|f1, f2| cmp.compare(&f1.smallest.encode(), &f2.smallest.encode()))
@@ -642,7 +922,7 @@ impl Builder {
         }
     }
 
-    fn maybe_add_file(&self, v: &mut Version, level: usize, f: Arc<FileMetaData>) {
+    fn maybe_add_file(&self, v: &mut Version<E>, level: usize, f: Arc<FileMetaData>) {
         // if file is deleted, do nothing
         if !self.deleted_files[level].contains(&f.number) {
             let last = &mut v.files[level].last();
@@ -669,7 +949,7 @@ const NEW_FILE: u32 = 7;
 // 8 was used for large value refs
 const PREV_LOG_NUMBER: u32 = 9;
 
-struct VersionEdit {
+pub struct VersionEdit {
     comparator: String,
     log_number: u64,
     prev_log_number: u64,
@@ -997,12 +1277,12 @@ mod tests {
 
         fn find(&self, key: Slice) -> usize {
             let target = InternalKey::new(key, 100, TYPE_VALUE);
-            let cmp = InternalKeyComparator::new(Rc::new(BitWiseComparator {}));
+            let cmp = InternalKeyComparator::new(Arc::new(BitWiseComparator {}));
             find_file(&cmp, &self.files, target.encode())
         }
 
         fn overlaps(&self, smallest: Option<Slice>, largest: Option<Slice>) -> bool {
-            let cmp = InternalKeyComparator::new(Rc::new(BitWiseComparator {}));
+            let cmp = InternalKeyComparator::new(Arc::new(BitWiseComparator {}));
             some_file_overlaps_range(
                 &cmp,
                 self.disjoint_sorted_files,

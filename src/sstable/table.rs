@@ -237,7 +237,7 @@ impl<'a, R: RandomAccessFile> BlockIterBuilder for TableBlockIterBuilder<'a, R> 
     }
 }
 
-struct TableBuilder<W: WritableFile> {
+pub struct TableBuilder<W: WritableFile> {
     options: Arc<Options>,
     file: W,
     offset: u64,
@@ -368,7 +368,7 @@ impl<W: WritableFile> TableBuilder<W> {
     // Finish building the table.  Stops using the file passed to the
     // constructor after this function returns.
     // REQUIRES: Finish(), Abandon() have not been called
-    pub fn finish(&mut self) -> Result<()> {
+    pub fn finish(&mut self, sync: bool) -> Result<()> {
         self.flush()?;
         assert!(!self.closed);
         self.closed = true;
@@ -441,6 +441,11 @@ impl<W: WritableFile> TableBuilder<W> {
         footer.encode_to(&mut buf);
         self.file.append(buf.as_slice())?;
         self.offset += buf.len() as u64;
+
+        if sync {
+            self.file.sync()?;
+            self.file.close()?;
+        }
 
         Ok(())
     }

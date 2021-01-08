@@ -7,6 +7,7 @@ use std::cmp::Ordering;
 use std::io::Write;
 use std::mem;
 use std::rc::Rc;
+use std::sync::Arc;
 
 // Grouping of constants.  We may want to make some of these
 // parameters set via options.
@@ -159,15 +160,15 @@ impl Default for InternalKey {
 
 #[derive(Clone)]
 pub struct InternalKeyComparator {
-    user_comparator: Rc<dyn Comparator<Slice>>,
+    user_comparator: Arc<dyn Comparator<Slice>>,
 }
 
 impl InternalKeyComparator {
-    pub fn new(user_comparator: Rc<dyn Comparator<Slice>>) -> Self {
+    pub fn new(user_comparator: Arc<dyn Comparator<Slice>>) -> Self {
         InternalKeyComparator { user_comparator }
     }
 
-    pub fn user_comparator(&self) -> Rc<dyn Comparator<Slice>> {
+    pub fn user_comparator(&self) -> Arc<dyn Comparator<Slice>> {
         self.user_comparator.clone()
     }
 }
@@ -360,14 +361,14 @@ mod tests {
 
     fn shorten(s: &Vec<u8>, l: &Vec<u8>) -> Vec<u8> {
         let mut result = Vec::from(s.as_slice());
-        let comparator = InternalKeyComparator::new(Rc::new(BitWiseComparator {}));
+        let comparator = InternalKeyComparator::new(Arc::new(BitWiseComparator {}));
         comparator.find_shortest_separator(&mut result, l.as_slice().into());
         result
     }
 
     fn short_successor(s: &Vec<u8>) -> Vec<u8> {
         let mut result = Vec::from(s.as_slice());
-        let comparator = InternalKeyComparator::new(Rc::new(BitWiseComparator {}));
+        let comparator = InternalKeyComparator::new(Arc::new(BitWiseComparator {}));
         comparator.find_short_successor(&mut result);
         result
     }

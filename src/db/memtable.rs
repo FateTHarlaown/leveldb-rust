@@ -16,18 +16,18 @@ use std::io::Write;
 use std::mem;
 use std::rc::Rc;
 use std::slice;
+use std::sync::Arc;
 
 pub struct MemTable {
     arena: Rc<RefCell<Arena>>,
     table: SkipList<Slice>,
-    comparator: Rc<dyn Comparator<Slice>>,
+    comparator: Arc<dyn Comparator<Slice>>,
 }
 
 impl MemTable {
-    pub fn new() -> Self {
+    pub fn new(internal_key_comparator: InternalKeyComparator) -> Self {
         let arena = Rc::new(RefCell::new(Arena::new()));
-        let comparator = Rc::new(BitWiseComparator {});
-        let internal_key_comparator = InternalKeyComparator::new(comparator.clone());
+        let comparator = internal_key_comparator.user_comparator();
         let key_comparator = KeyComparator {
             comparator: internal_key_comparator,
         };

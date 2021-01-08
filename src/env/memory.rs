@@ -303,6 +303,14 @@ impl Env for MemEnv {
     fn get_test_dir(&self) -> Result<String> {
         Ok("/test".to_string())
     }
+
+    fn lock_file(&self, fname: &String) -> Result<()> {
+        Ok(())
+    }
+
+    fn unlock_file(&self, fname: &String) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

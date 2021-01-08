@@ -54,6 +54,21 @@ pub struct Options {
     // leave this parameter alone.
     pub block_restart_interval: u32,
 
+    // Leveldb will write up to this amount of bytes to a file before
+    // switching to a new one.
+    // Most clients should leave this parameter alone.  However if your
+    // filesystem is more efficient with larger files, you could
+    // consider increasing the value.  The downside will be longer
+    // compactions and hence longer latency/performance hiccups.
+    // Another reason to increase this parameter might be when you are
+    // initially populating a large database.
+    pub max_file_size: usize,
+
+    // Number of open files that can be used by the DB.  You may need to
+    // increase this if your database has a large working set (budget
+    // one open file per 2MB of working set).
+    pub max_open_files: u64,
+
     // Compress blocks using the specified compression algorithm.  This
     // parameter can be changed dynamically.
     //
@@ -74,6 +89,31 @@ pub struct Options {
     // Many applications will benefit from passing the result of
     // NewBloomFilterPolicy() here.
     pub filter_policy: Option<Rc<dyn FilterPolicy>>,
+
+    // -------------------
+    // Parameters that affect performance
+
+    // Amount of data to build up in memory (backed by an unsorted log
+    // on disk) before converting to a sorted on-disk file.
+    //
+    // Larger values increase performance, especially during bulk loads.
+    // Up to two write buffers may be held in memory at the same time,
+    // so you may wish to adjust this parameter to control memory usage.
+    // Also, a larger write buffer will result in a longer recovery time
+    // the next time the database is opened.
+    pub write_buffer_size: usize,
+
+    // EXPERIMENTAL: If true, append to existing MANIFEST and log files
+    // when a database is opened.  This can significantly speed up open.
+    //
+    // Default: currently false, but may become true later.
+    pub reuse_log: bool,
+
+    // If true, an error is raised if the database already exists.
+    pub error_if_exists: bool,
+
+    // If true, the database will be created if it is missing.
+    pub create_if_missing: bool,
 }
 
 impl Default for Options {
@@ -82,10 +122,16 @@ impl Default for Options {
             comparator: Arc::new(BitWiseComparator {}),
             block_size: 4 * 1024,
             block_restart_interval: 16,
+            max_file_size: 2 * 1024 * 1024,
+            max_open_files: 1000,
             compression_type: SNAPPY_COMPRESSION,
             paranoid_checks: false,
             block_cache: None,
             filter_policy: None,
+            write_buffer_size: 4 * 1024 * 1024,
+            reuse_log: false,
+            error_if_exists: false,
+            create_if_missing: false,
         }
     }
 }

@@ -145,6 +145,12 @@ impl WriteBatch {
     pub fn sequence(&self) -> SequenceNumber {
         self.rep.as_slice().read_u64::<LittleEndian>().unwrap()
     }
+
+    pub fn set_content(&mut self, content: &Vec<u8>) {
+        assert!(content.len() >= HEADER);
+        self.rep.clear();
+        self.rep.clone_from(content);
+    }
 }
 
 pub trait Handler {
@@ -180,8 +186,8 @@ mod tests {
     use std::rc::Rc;
 
     fn print_content(b: &WriteBatch) -> Vec<u8> {
-        let cmp = InternalKeyComparator::new(Rc::new(BitWiseComparator {}));
-        let mem = Arc::new(MemTable::new());
+        let cmp = InternalKeyComparator::new(Arc::new(BitWiseComparator {}));
+        let mem = Arc::new(MemTable::new(cmp));
         let mut iter = mem.iter();
         let ret = b.insert_into(mem.clone());
 

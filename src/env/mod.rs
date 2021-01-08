@@ -59,6 +59,10 @@ pub trait Env: Send + Sync + Clone + 'static {
     // between runs of the same process, but subsequent calls will return the
     // same directory.
     fn get_test_dir(&self) -> Result<String>;
+
+    fn lock_file(&self, fname: &String) -> Result<()>;
+
+    fn unlock_file(&self, fname: &String) -> Result<()>;
     //TODO: add many other func
 }
 
