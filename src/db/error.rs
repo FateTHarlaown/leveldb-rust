@@ -2,6 +2,7 @@ use failure::Fail;
 
 use crossbeam_channel::RecvError;
 use failure::_core::num::ParseIntError;
+use std::fmt;
 use std::io;
 use std::result;
 use std::string::FromUtf8Error;
@@ -33,6 +34,12 @@ pub enum StatusError {
 
     #[fail(display = "{}", _0)]
     UTF8Error(FromUtf8Error),
+
+    #[fail(display = "{}", _0)]
+    DBClose(String),
+
+    #[fail(display = "{}", _0)]
+    Customize(String),
 }
 
 impl From<io::Error> for StatusError {

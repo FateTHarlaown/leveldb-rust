@@ -12,8 +12,8 @@ use crate::env::{read_file_to_vec, Env};
 use crate::util::cache::Cache;
 use crate::util::cmp::Comparator;
 
-use crate::db::filename::{current_file_name, descriptor_file_name, set_current_file};
 use crate::db::filename::FileType::CurrentFile;
+use crate::db::filename::{current_file_name, descriptor_file_name, set_current_file};
 use crate::db::log::{LogReader, LogWriter};
 use crate::db::option::Options;
 use crate::util::buffer::BufferReader;
@@ -24,9 +24,10 @@ use std::cmp::Ordering;
 use std::collections::hash_set::Difference;
 use std::collections::linked_list::LinkedList;
 use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::fs::Metadata;
 use std::io::Write;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone)]
 pub struct FileMetaData {
@@ -118,7 +119,7 @@ pub struct Version<E: Env> {
     table_cache: TableCache<E>,
     options: Arc<Options>,
     files: Vec<Vec<Arc<FileMetaData>>>,
-    file_to_compact: Option<Arc<FileMetaData>>,
+    file_to_compact: RwLock<Option<(Arc<FileMetaData>, usize)>>,
     icmp: InternalKeyComparator,
     compaction_score: f64,
     compaction_level: i32,
@@ -136,7 +137,7 @@ impl<E: Env> Version<E> {
             table_cache,
             options,
             files,
-            file_to_compact: None,
+            file_to_compact: RwLock::new(None),
             icmp,
             compaction_score: -1f64,
             compaction_level: -1,
@@ -355,6 +356,16 @@ impl<E: Env> Version<E> {
         }
 
         level
+    }
+
+    pub fn update_stats(&self, meta: Arc<FileMetaData>, level: usize) -> bool {
+        let mut to_compact = self.file_to_compact.write().unwrap();
+        if meta.allowed_seeks - 1 <= 0 && to_compact.is_none() {
+            *to_compact = Some((meta, level));
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -737,7 +748,11 @@ impl<E: Env> VersionSet<E> {
         edit.set_next_file(self.next_file_number);
         edit.set_last_sequence(self.prev_log_number);
 
-        let mut v = Version::new(self.icmp.clone(), self.options.clone(), self.table_cache.clone());
+        let mut v = Version::new(
+            self.icmp.clone(),
+            self.options.clone(),
+            self.table_cache.clone(),
+        );
         let mut builder = Builder::new(self.current(), self.icmp.clone());
         builder.apply(edit, &mut self.compact_pointer);
         builder.save_to(&mut v);
@@ -758,7 +773,6 @@ impl<E: Env> VersionSet<E> {
                     return Err(e);
                 }
             }
-
         }
 
         // Write new record to MANIFEST log
@@ -780,13 +794,12 @@ impl<E: Env> VersionSet<E> {
     }
 
     fn write_snapshot(&self, writer: &mut LogWriter<E::WrFile>) -> Result<()> {
-
         // Save metadata
         let mut edit = VersionEdit::default();
         edit.set_comparator_name(&self.icmp.user_comparator().name().to_string());
 
         // Save compaction pointers
-        for (i,c) in self.compact_pointer.iter().enumerate() {
+        for (i, c) in self.compact_pointer.iter().enumerate() {
             if !c.is_empty() {
                 let mut key = InternalKey::new_empty_key();
                 key.decode_from(c.as_slice().into());
@@ -797,7 +810,13 @@ impl<E: Env> VersionSet<E> {
         // Save files
         for (i, files) in self.current().files.iter().enumerate() {
             for f in files.iter() {
-                edit.add_file(i as u32, f.number, f.file_size, f.smallest.clone(), f.largest.clone());
+                edit.add_file(
+                    i as u32,
+                    f.number,
+                    f.file_size,
+                    f.smallest.clone(),
+                    f.largest.clone(),
+                );
             }
         }
 

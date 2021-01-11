@@ -11,22 +11,22 @@ use crate::db::log::LogWriter;
 use crate::db::memtable::MemTable;
 use crate::db::option::Options;
 use crate::db::table_cache::TableCache;
-use crate::db::version::{FileMetaData, Version, VersionEdit, VersionSet, CompactionState};
+use crate::db::version::{CompactionState, FileMetaData, Version, VersionEdit, VersionSet};
 use crate::db::write_batch::WriteBatch;
 use crate::db::{slice::Slice, ReadOption, Reporter, DB};
 use crate::db::{WritableFile, WriteOption};
 use crate::env::Env;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use crossbeam_utils::sync::ShardedLock;
+use failure::_core::option::Option::Some;
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
-use std::sync::{atomic::AtomicBool, Arc, Condvar, Mutex, MutexGuard, RwLock};
+use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread;
 use std::time::Instant;
 
 const NUM_NON_TABLE_CACHE_FILES: u64 = 10;
-
 
 pub struct LevelDB<E: Env> {
     inner: Arc<DBImplInner<E>>,
@@ -76,99 +76,100 @@ impl<E: Env> LevelDB<E> {
     }
 
     fn run_write_worker(&self) {
-
-    }
-
-    fn run_compaction_worker(&self) {
-
-    }
-
-    /*
-    fn run_write_worker(&self) -> Result<()> {
         let inner = self.inner.clone();
-        thread::spawn(move || {
-            loop {
-                // TODO: is DB closed ?
+        thread::Builder::new()
+            .name("Writer".to_string())
+            .spawn(move || {
+                loop {
+                    let mut queue = inner.batch_write_queue.lock().unwrap();
+                    // db closed, clean the write queue.
+                    if inner.shutdown.load(Ordering::Acquire) == true {
+                        while let Some(task) = queue.pop_front() {
+                            match task {
+                                BatchTask::Write(w) => {
+                                    w.notifier.send(Err(StatusError::DBClose(
+                                        "leveldb is closing".to_string(),
+                                    )));
+                                }
+                                _ => {}
+                            }
+                        }
+                        break;
+                    }
 
-                let mut batch;
-                let mut senders;
-                let mut sync;
-                let mut last_seq;
-                {
-                    let mut locked_fields = inner.lock_data.lock().unwrap();
-                    if locked_fields.write_queue.is_empty() {
-                        locked_fields = inner
+                    if queue.is_empty() {
+                        queue = inner
                             .batch_write_cond
-                            .wait_while(locked_fields, |f| f.write_queue.is_empty())
+                            .wait_while(queue, |q| q.is_empty())
                             .unwrap();
                     }
-
-                    let first = locked_fields.write_queue.pop_front().unwrap();
-                    let joined = match first {
-                        WriteTask::Write(w) => {
-                            join_write_batch_from_queue(w, &mut locked_fields.write_queue)
-                        }
-                        // TODO：colse or compaction
-                        WriteTask::Compaction(c) => unimplemented!(),
-                        WriteTask::Close => unimplemented!(),
+                    let first = queue.pop_front().unwrap();
+                    let (force_compaction, frist_writer) = match first {
+                        BatchTask::Write(w) => (w.batch.is_none(), w),
+                        BatchTask::Close => break,
                     };
-                    batch = joined.0;
-                    senders = joined.1;
-                    sync = joined.2;
+                    // unlock the queue when make room for write so other writers can add request to the queue
+                    std::mem::drop(queue);
 
-                    // TODO: make room
-                    last_seq = locked_fields.versions.get_last_sequence();
-                    batch.set_sequence(last_seq + 1);
-                    last_seq += u64::from(batch.count());
-                }
+                    match inner.make_room_for_write(force_compaction) {
+                        Ok(versions) => {
+                            let (mut batch, senders, sync) = inner.build_batch_group(frist_writer);
+                            if batch.count() > 0 {
+                                let mut last_sequence = versions.get_last_sequence();
+                                batch.set_sequence(last_sequence + 1);
+                                last_sequence += batch.count() as u64;
 
-                // Add to log and apply to memtable.  We can release the lock
-                // during this phase since &w is currently responsible for logging
-                // and protects against concurrent loggers and concurrent writes
-                // into mem_.
-                let mut ret;
-                let mut sync_err;
-                {
-                    // flush wal log
-                    let mut wal = inner.wal.lock().unwrap();
-                    ret = wal.log.add_record(batch.get_content().as_slice());
-                    sync_err = false;
-                    if ret.is_ok() && sync {
-                        ret = wal.log.sync();
-                        sync_err = ret.is_err();
+                                let mut wal = inner.wal.lock().unwrap();
+                                let log_writer = wal.log.as_mut().unwrap();
+                                let mut res = log_writer.add_record(batch.get_content().as_slice());
+                                let mut sync_error = false;
+                                if res.is_ok() && sync {
+                                    res = log_writer.sync();
+                                    sync_error = res.is_err();
+                                }
+                                if res.is_ok() {
+                                    let mem = inner.mem.read().unwrap();
+                                    let mem = mem.as_ref().unwrap();
+                                    res = batch.insert_into(mem.clone());
+                                }
+
+                                match res {
+                                    Ok(_) => {
+                                        //TODO: log the error
+                                        senders
+                                            .iter()
+                                            .for_each(|s| s.send(Ok(())).unwrap_or_else(|e| {}))
+                                    }
+                                    Err(e) => {
+                                        senders.iter().for_each(|s| {
+                                            s.send(Err(StatusError::Customize(
+                                                "meet error when write".to_string(),
+                                            )))
+                                            .unwrap_or_else(|e| {})
+                                        });
+                                        if sync_error {
+                                            inner.record_back_ground_error(e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Err(e) => frist_writer
+                            .notifier
+                            .send(Err(StatusError::Customize(format!(
+                                "meet error when making room for write request {:?}",
+                                e
+                            ))))
+                            .unwrap_or_else(|e| {}),
                     }
                 }
-
-                if ret.is_ok() {
-                    ret = batch.insert_into(inner.mem.clone())
-                }
-
-                {
-                    let mut locked_fields = inner.lock_data.lock().unwrap();
-                    if sync_err {
-                        // record background error.
-                        // The state of the log file is indeterminate: the log record we
-                        // just added may or may not show up when the DB is re-opened.
-                        // So we force the DB into a mode where all future writes fail.
-                    }
-                    locked_fields.versions.set_last_sequence(last_seq);
-                }
-
-                for sender in senders {
-                    if let Err(e) = sender.send(()) {
-                        // TODO: log error
-                    }
-                }
-            }
-        });
-
-        Ok(())
+            })
+            .unwrap();
     }
-     */
 
-
+    fn run_compaction_worker(&self) {}
 }
-
 
 #[derive(Clone)]
 struct LogReporter {
@@ -206,18 +207,14 @@ impl Reporter for LogReporter {
 }
 
 struct Writer {
-    batch: WriteBatch,
+    // none means force to compact memtable
+    batch: Option<WriteBatch>,
+    notifier: Sender<Result<()>>,
     sync: bool,
-    notifier: Sender<()>,
 }
 
-struct Compacter {
-    notifier: Sender<()>,
-}
-
-enum WriteTask {
+enum BatchTask {
     Write(Writer),
-    Compaction(Compacter),
     Close,
 }
 
@@ -229,6 +226,7 @@ struct Wal<W: WritableFile> {
 // unsafe impl Send and Sync to operate fields log，table_cache and mem.
 unsafe impl<E: Env> Send for DBImplInner<E> {}
 unsafe impl<E: Env> Sync for DBImplInner<E> {}
+
 struct DBImplInner<E: Env> {
     dbname: String,
     internal_comparator: InternalKeyComparator,
@@ -241,18 +239,24 @@ struct DBImplInner<E: Env> {
     imm: ShardedLock<Option<Arc<MemTable>>>,
     versions: Mutex<VersionSet<E>>,
     // for write batch
-    batch_write_queue: Mutex<VecDeque<WriteTask>>,
+    batch_write_queue: Mutex<VecDeque<BatchTask>>,
     batch_write_cond: Condvar,
 
     // Have we encountered a background error in paranoid mode
     background_error: RwLock<Option<StatusError>>,
+    shutdown: AtomicBool,
 }
 
 impl<E: Env> DBImplInner<E> {
     pub fn new(raw_options: Options, dbname: String, env: E) -> Self {
         // TODO: sanitize options
         let op = Arc::new(raw_options);
-        let table_cache = TableCache::new(dbname.clone(), op.clone(), env.clone(), table_cache_size(&op));
+        let table_cache = TableCache::new(
+            dbname.clone(),
+            op.clone(),
+            env.clone(),
+            table_cache_size(&op),
+        );
         let icmp = InternalKeyComparator::new(op.comparator.clone());
         DBImplInner {
             dbname: dbname.clone(),
@@ -270,44 +274,63 @@ impl<E: Env> DBImplInner<E> {
             batch_write_queue: Mutex::new(VecDeque::new()),
             batch_write_cond: Condvar::new(),
             background_error: RwLock::new(None),
+            shutdown: AtomicBool::new(false),
         }
     }
 
     pub fn write(&self, options: &WriteOption, updates: Option<WriteBatch>) -> Result<()> {
         let (sender, recv) = bounded(1);
-        let task = if let Some(w) = updates {
-            WriteTask::Write(Writer {
-                batch: w,
-                sync: options.sync,
-                notifier: sender,
-            })
-        } else {
-            WriteTask::Compaction(Compacter { notifier: sender })
-        };
+        let task = BatchTask::Write(Writer {
+            batch: updates,
+            notifier: sender,
+            sync: options.sync,
+        });
 
-        self.batch_write_queue
-            .lock()
-            .unwrap()
-            .push_back(task);
+        self.batch_write_queue.lock().unwrap().push_back(task);
         self.batch_write_cond.notify_all();
         recv.recv()?;
         Ok(())
     }
 
-    pub fn recover(
-        &self,
-        edit: &mut VersionEdit,
-        save_manifest: &mut bool,
-    ) -> Result<()> {
+    pub fn get(&self, read_options: &ReadOption, key: Slice, val: &mut Vec<u8>) -> Result<()> {
+        // TODO: surport snapshot read
+        let snapshot = self.versions.lock().unwrap().get_last_sequence();
+        let lookup_key = LookupKey::new(key, snapshot);
+        if let Some(v) = self
+            .mem
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get(&lookup_key)?
+        {
+            val.extend_from_slice(v.as_ref());
+            return Ok(());
+        }
+
+        if let Some(m) = self.imm.read().unwrap().as_ref() {
+            if let Some(v) = m.get(&lookup_key)? {
+                val.extend_from_slice(v.as_ref());
+                return Ok(());
+            }
+        }
+
+        let current = self.versions.lock().unwrap().current();
+        let (meta, level) = current.get(read_options, &lookup_key, val, &self.table_cache)?;
+        if current.update_stats(meta, level) {
+            self.maybe_schedule_compaction();
+        }
+
+        Ok(())
+    }
+
+    pub fn recover(&self, edit: &mut VersionEdit, save_manifest: &mut bool) -> Result<()> {
         // Ignore error from CreateDir since the creation of the DB is
         // committed only when the descriptor is created, and this directory
         // may already exist from a previous failed creation attempt.
         self.env.create_dir(&self.dbname);
         // TODO: add file lock
-        if !self
-            .env
-            .file_exists(&current_file_name(&self.dbname))
-        {
+        if !self.env.file_exists(&current_file_name(&self.dbname)) {
             if self.options.create_if_missing {
                 self.new_db()?;
             } else {
@@ -413,9 +436,7 @@ impl<E: Env> DBImplInner<E> {
             }
             batch.set_content(&record);
             if mem.is_none() {
-                mem.replace(Arc::new(MemTable::new(
-                    self.internal_comparator.clone(),
-                )));
+                mem.replace(Arc::new(MemTable::new(self.internal_comparator.clone())));
             }
 
             let memtable = mem.as_ref().unwrap();
@@ -443,7 +464,6 @@ impl<E: Env> DBImplInner<E> {
             }
         }
 
-
         if res.is_ok() && self.options.reuse_log && last_log && compaction == 0 {
             let mut inner_mem = self.mem.write().unwrap();
             assert!(inner_mem.is_none());
@@ -459,9 +479,8 @@ impl<E: Env> DBImplInner<E> {
                 if mem.is_some() {
                     inner_mem.get_or_insert(mem.take().unwrap());
                 } else {
-                    inner_mem.get_or_insert(Arc::new(MemTable::new(
-                        self.internal_comparator.clone(),
-                    )));
+                    inner_mem
+                        .get_or_insert(Arc::new(MemTable::new(self.internal_comparator.clone())));
                 }
             }
         }
@@ -555,13 +574,60 @@ impl<E: Env> DBImplInner<E> {
         res
     }
 
-    fn deleted_obsoleted_files(&self) {
+    fn deleted_obsoleted_files(&self) {}
 
+    fn maybe_schedule_compaction(&self) {}
+
+    fn build_batch_group(&self, first: Writer) -> (WriteBatch, Vec<Sender<Result<()>>>, bool) {
+        let sync = first.sync;
+        let mut batch = WriteBatch::new();
+        let mut senders = Vec::new();
+        senders.push(first.notifier.clone());
+
+        if let Some(b) = first.batch {
+            batch.append(&b);
+            let mut size = batch.approximate_size();
+            // Allow the group to grow up to a maximum size, but if the
+            // original write is small, limit the growth so we do not slow
+            // down the small write too much.
+            let max_size = if size < 128 << 10 {
+                size + 128 << 10
+            } else {
+                1 << 20
+            };
+
+            let mut queue = self.batch_write_queue.lock().unwrap();
+            while let Some(task) = queue.front() {
+                match task {
+                    BatchTask::Write(w) => {
+                        // Do not include a sync write into a batch handled by a non-sync write and do not include a force compaction task.
+                        if (w.sync && !sync) || w.batch.is_none() {
+                            break;
+                        }
+                        batch.append(w.batch.as_ref().unwrap());
+                        senders.push(w.notifier.clone());
+                        queue.pop_front();
+                        size = batch.approximate_size();
+                        if size > max_size {
+                            break;
+                        }
+                    }
+                    BatchTask::Close => break,
+                }
+            }
+        }
+
+        (batch, senders, sync)
     }
 
+    fn make_room_for_write(&self, force: bool) -> Result<MutexGuard<VersionSet<E>>> {
+        let mut versions = self.versions.lock().unwrap();
+        Ok(versions)
+    }
 
-    fn maybe_schedule_compaction(&self) {
-
+    fn record_back_ground_error(&self, e: StatusError) {
+        let mut back_ground_error = self.background_error.write().unwrap();
+        back_ground_error.get_or_insert(e);
     }
 }
 
@@ -569,55 +635,6 @@ fn maybe_ignore_error(res: &mut Result<()>, paranoid_checks: bool) {
     if !paranoid_checks && res.is_err() {
         *res = Ok(());
     }
-}
-
-fn join_write_batch_from_queue(
-    mut first: Writer,
-    queue: &mut VecDeque<WriteTask>,
-) -> (WriteBatch, Vec<Sender<()>>, bool) {
-    let mut senders = Vec::new();
-    let mut batch = WriteBatch::new();
-    batch.append(&first.batch);
-    let mut size = batch.approximate_size();
-    let max_size = if size < 128 << 10 {
-        size + 128 << 10
-    } else {
-        1 << 20
-    };
-
-    while !queue.is_empty() {
-        let cur = queue.pop_front().unwrap();
-        let continue_next = match cur {
-            WriteTask::Write(w) => {
-                if !first.sync && w.sync {
-                    size += w.batch.approximate_size();
-                    if size > max_size {
-                        break;
-                    }
-                    senders.push(w.notifier.clone());
-                    batch.append(&w.batch);
-                    true
-                } else {
-                    queue.push_front(WriteTask::Write(w));
-                    false
-                }
-            }
-            WriteTask::Compaction(c) => {
-                queue.push_front(WriteTask::Compaction(c));
-                false
-            }
-            _ => {
-                queue.push_front(WriteTask::Close);
-                false
-            }
-        };
-
-        if !continue_next {
-            break;
-        }
-    }
-
-    (batch, senders, first.sync)
 }
 
 fn clip_to_range<T: PartialOrd + Copy>(source: &mut T, min: &T, max: &T) {

@@ -1,10 +1,10 @@
+use crate::db::db_impl::LevelDB;
 use crate::db::error::{Result, StatusError};
 use crate::db::option::Options;
 use crate::db::slice::Slice;
+use crate::db::version::{VersionEdit, VersionSet};
 use crate::db::write_batch::WriteBatch;
 use crate::env::Env;
-use crate::db::db_impl::LevelDB;
-use crate::db::version::{VersionSet, VersionEdit};
 
 mod builder;
 mod db_impl;
@@ -213,4 +213,3 @@ pub trait DB {
     // Note: consider setting options.sync = true.
     fn write(&self, options: &WriteOption, updates: Option<WriteBatch>) -> Result<()>;
 }
-
