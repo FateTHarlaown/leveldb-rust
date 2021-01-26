@@ -6,7 +6,9 @@ use crate::db::slice::Slice;
 use crate::db::Iterator;
 use crate::util::arena::Arena;
 use crate::util::cmp::{BitWiseComparator, Comparator};
-use crate::util::coding::{put_varint32, varint_length, DecodeVarint, EncodeVarint};
+use crate::util::coding::{
+    put_varint32, varint_length, DecodeVarint, EncodeVarint, VarLengthSliceWriter,
+};
 
 use crate::util::buffer::BufferReader;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -133,7 +135,9 @@ impl<'a> Iterator for MemTableIterator<'a> {
     }
 
     fn seek(&mut self, target: Slice) {
-        self.iter.seek(&target)
+        self.tmp.clear();
+        encode_key(&mut self.tmp, target);
+        self.iter.seek(&self.tmp.as_slice().into());
     }
 
     fn next(&mut self) {
@@ -185,7 +189,7 @@ impl Comparator<Slice> for KeyComparator {
     }
 }
 
-fn get_length_prefixed_slice(mut buf: &mut &[u8]) -> Slice {
+pub fn get_length_prefixed_slice(mut buf: &mut &[u8]) -> Slice {
     let len = buf.decode_varint32().unwrap();
     buf.read_bytes(len as usize).unwrap().into()
 }

@@ -90,7 +90,14 @@ impl BlockIter {
 
     // Return the offset in data_ just past the end of the current entry.
     fn next_entry_offset(&self) -> u32 {
-        self.current + self.value.size() as u32
+        let offset = unsafe {
+            self.value
+                .data()
+                .offset(self.value.size() as isize)
+                .offset_from(self.block_content.data.as_ptr())
+        };
+
+        offset as u32
     }
 
     fn get_restart_point(&self, index: u32) -> u32 {
@@ -105,7 +112,13 @@ impl BlockIter {
         self.key.clear();
         self.restart_index = index;
         self.current = self.get_restart_point(index);
-        self.value = Default::default();
+        let ptr = unsafe {
+            self.block_content
+                .data
+                .as_ptr()
+                .offset(self.current as isize)
+        };
+        self.value = Slice::new(ptr, 0);
     }
 
     fn decode_entry(&mut self, offset: u32) -> Result<(u32, u32, u32, u32)> {
@@ -124,10 +137,10 @@ impl BlockIter {
             shared = data.decode_varint32()?;
             non_shared = data.decode_varint32()?;
             value_len = data.decode_varint32()?;
+            step -= data.len();
         }
-        step -= data.len();
         let remain = self.restarts - offset - step as u32;
-        if remain < shared + non_shared {
+        if remain < non_shared + value_len {
             return Err(StatusError::Corruption("bad entry in block".to_string()));
         }
 
@@ -193,7 +206,7 @@ impl Iterator for BlockIter {
         while left < right {
             let mid = (left + right + 1) / 2;
             let region_offset = self.get_restart_point(mid);
-            if let Ok((non_shared, shared, _, step)) = self.decode_entry(region_offset) {
+            if let Ok((shared, non_shared, _, step)) = self.decode_entry(region_offset) {
                 if shared != 0 {
                     self.corruption_error();
                     return;
@@ -246,7 +259,7 @@ impl Iterator for BlockIter {
         self.seek_to_restart_point(self.restart_index);
         loop {
             // Loop until end of current entry hits the start of original entry
-            if !self.parse_next_key() || self.next_entry_offset() < original {
+            if !self.parse_next_key() || self.next_entry_offset() >= original {
                 break;
             }
         }
@@ -311,6 +324,12 @@ impl BlockBuilder {
         let last_key_piece = self.last_key.as_slice().into();
         assert!(!self.finished);
         assert!(self.counter <= self.block_restart_interval);
+        if !self.buffer.is_empty() {
+            assert_eq!(
+                self.comparator.compare(&key, &last_key_piece),
+                Ordering::Greater
+            );
+        }
         assert!(
             self.buffer.is_empty()
                 || self.comparator.compare(&key, &last_key_piece) == Ordering::Greater

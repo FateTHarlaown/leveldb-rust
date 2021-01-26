@@ -8,17 +8,17 @@ use crate::env::Env;
 
 mod builder;
 mod db_impl;
-mod dbformat;
+pub mod dbformat;
 pub mod error;
 mod filename;
 pub mod log;
-mod memtable;
+pub mod memtable;
 pub mod option;
 pub mod skiplist;
 pub mod slice;
 mod table_cache;
 mod version;
-mod write_batch;
+pub mod write_batch;
 
 // DB contents are stored in a set of blocks, each of which holds a
 // sequence of key,value pairs.  Each block may be compressed before

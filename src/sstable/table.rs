@@ -101,7 +101,7 @@ impl<R: RandomAccessFile> Table<R> {
             iter.seek(key.as_slice().into());
             if iter.valid() && cmp.compare(&key.as_slice().into(), &iter.key()) == Ordering::Equal {
                 let mut handle = BlockHandle::default();
-                handle.decode_from(iter.value())?;
+                handle.decode_from(&mut iter.value().as_ref())?;
                 let filter_block_content =
                     BlockContent::read_block_from_file(&self.file, handle, &read_option)?;
                 self.filter_block_data.get_or_insert(filter_block_content);
@@ -117,7 +117,7 @@ impl<R: RandomAccessFile> Table<R> {
         index_value: Slice,
     ) -> Result<BlockIter> {
         let mut block_handle: BlockHandle = Default::default();
-        block_handle.decode_from(index_value)?;
+        block_handle.decode_from(&mut index_value.as_ref())?;
 
         if let Some(ref cache) = self.options.block_cache {
             let mut cache_key_buffer = Vec::new();
@@ -171,7 +171,7 @@ impl<R: RandomAccessFile> Table<R> {
         index_iter.seek(key);
         if index_iter.valid() {
             let mut handle = BlockHandle::default();
-            handle.decode_from(index_iter.value())?;
+            handle.decode_from(&mut index_iter.value().as_ref())?;
             if let Some(ref filter_data) = self.filter_block_data {
                 // use filter to check if this key exists.
                 // if the filter_date if Some, we must have filter policy.
@@ -209,7 +209,7 @@ impl<R: RandomAccessFile> Table<R> {
         index_iter.seek(key);
         if index_iter.valid() {
             let mut handle = BlockHandle::default();
-            if handle.decode_from(index_iter.value()).is_ok() {
+            if handle.decode_from(&mut index_iter.value().as_ref()).is_ok() {
                 handle.offset()
             } else {
                 // key is past the last key in the file.  Approximate the offset
@@ -523,4 +523,860 @@ fn write_raw_block<W: WritableFile>(
     file.append(trailer.as_ref())?;
     *offset += (block_content.size() + BLOCK_TRAILER_SIZE) as u64;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::dbformat::{
+        append_internal_key, parse_internal_key, InternalKeyComparator, ParsedInternalKey,
+        MAX_SEQUENCE_NUMBER, TYPE_VALUE,
+    };
+    use crate::db::error::{Result, StatusError};
+    use crate::db::memtable::{get_length_prefixed_slice, MemTable};
+    use crate::db::option::{Options, NO_COMPRESSION};
+    use crate::db::slice::Slice;
+    use crate::db::write_batch::WriteBatch;
+    use crate::db::Iterator as MyIter;
+    use crate::db::{RandomAccessFile, ReadOption, WritableFile};
+    use crate::env::Env;
+    use crate::sstable::block::{Block, BlockBuilder};
+    use crate::sstable::format::BlockContent;
+    use crate::sstable::table::{Table, TableBuilder};
+    use crate::util::cmp::{BitWiseComparator, Comparator};
+    use crate::util::testutil::{compressible_vec_str, random_key, random_vec_str};
+    use rand::prelude::ThreadRng;
+    use rand::{thread_rng, Rng};
+    use std::cell::RefCell;
+    use std::cmp::Ordering;
+    use std::rc::Rc;
+    use std::slice::Iter;
+    use std::sync::Arc;
+
+    fn reverse(key: Slice) -> Vec<u8> {
+        let mut ret = Vec::from(key.as_ref());
+        ret.reverse();
+        ret
+    }
+
+    struct ReverseKeyComparator {}
+
+    impl Comparator<Slice> for ReverseKeyComparator {
+        fn compare<'a>(&self, left: &'a Slice, right: &'a Slice) -> Ordering {
+            BitWiseComparator {}.compare(
+                &reverse(*left).as_slice().into(),
+                &reverse(*right).as_slice().into(),
+            )
+        }
+
+        fn name(&self) -> &'static str {
+            "leveldb.ReverseBytewiseComparator"
+        }
+
+        fn find_shortest_separator(&self, start: &mut Vec<u8>, limit: Slice) {
+            let mut s = reverse(start.as_slice().into());
+            let l = reverse(limit);
+            BitWiseComparator {}.find_shortest_separator(&mut s, l.as_slice().into());
+            *start = reverse(s.as_slice().into());
+        }
+
+        fn find_short_successor(&self, key: &mut Vec<u8>) {
+            let s = reverse(key.as_slice().into());
+            BitWiseComparator {}.find_short_successor(key);
+            *key = reverse(s.as_slice().into());
+        }
+    }
+
+    fn increment(cmp: Arc<dyn Comparator<Slice>>, key: &mut Vec<u8>) {
+        let bcmp = BitWiseComparator {};
+        if cmp.name() == bcmp.name() {
+            key.push(0);
+        } else {
+            assert_eq!(cmp.name(), ReverseKeyComparator {}.name());
+            let mut rev = reverse(key.as_slice().into());
+            rev.push(0);
+            *key = rev;
+        }
+    }
+
+    #[derive(Clone)]
+    struct MemFile {
+        content: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl MemFile {
+        pub fn new() -> Self {
+            MemFile {
+                content: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+
+        pub fn clear(&self) {
+            self.content.borrow_mut().clear();
+        }
+    }
+
+    impl WritableFile for MemFile {
+        fn append(&mut self, data: &[u8]) -> Result<()> {
+            self.content.borrow_mut().extend_from_slice(data);
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn sync(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl RandomAccessFile for MemFile {
+        fn read(&self, offset: usize, n: usize, scratch: &mut Vec<u8>) -> Result<Slice> {
+            let content = self.content.borrow();
+            scratch.clear();
+            if offset >= content.len() {
+                return Err(StatusError::InvalidArgument(
+                    "invalid read offset".to_string(),
+                ));
+            }
+
+            let n = if n + offset > content.len() {
+                content.len() - offset
+            } else {
+                n
+            };
+
+            let data = content[offset..(offset + n)].as_ref();
+            scratch.extend_from_slice(data);
+            Ok(scratch.as_slice().into())
+        }
+    }
+
+    type KVBytes = Vec<u8>;
+
+    trait MaterialBuilder {
+        fn finish(&mut self, options: Arc<Options>, kvs: &mut Vec<(KVBytes, KVBytes)>);
+        fn new_iterator<'a>(&'a self) -> Box<dyn MyIter + 'a>;
+        fn add(&mut self, key: Vec<u8>, val: Vec<u8>);
+    }
+
+    struct ConstructorData {
+        data: Vec<(KVBytes, KVBytes)>,
+        comparator: Arc<dyn Comparator<Slice>>,
+    }
+
+    impl ConstructorData {
+        pub fn get_sorted_unique_data(&mut self) -> Vec<(KVBytes, KVBytes)> {
+            let cmp = self.comparator.clone();
+            self.data
+                .sort_by(|a, b| cmp.compare(&a.0.as_slice().into(), &b.0.as_slice().into()));
+            let mut res: Vec<(KVBytes, KVBytes)> = Vec::new();
+            for (k, v) in self.data.iter() {
+                if let Some((last_k, _)) = res.last() {
+                    if self
+                        .comparator
+                        .compare(&last_k.as_slice().into(), &k.as_slice().into())
+                        == Ordering::Equal
+                    {
+                        continue;
+                    }
+                }
+                res.push((k.clone(), v.clone()))
+            }
+            res
+        }
+
+        pub fn add(&mut self, key: Vec<u8>, val: Vec<u8>) {
+            self.data.push((key, val));
+        }
+    }
+
+    struct BlockConstructor {
+        pub constructor_data: ConstructorData,
+        comparator: Arc<dyn Comparator<Slice>>,
+        block: Option<Block>,
+    }
+
+    impl BlockConstructor {
+        pub fn new(comparator: Arc<dyn Comparator<Slice>>) -> Self {
+            BlockConstructor {
+                comparator: comparator.clone(),
+                block: None,
+                constructor_data: ConstructorData {
+                    data: Vec::new(),
+                    comparator,
+                },
+            }
+        }
+    }
+
+    impl MaterialBuilder for BlockConstructor {
+        fn finish(&mut self, options: Arc<Options>, kvs: &mut Vec<(KVBytes, KVBytes)>) {
+            let data = self.constructor_data.get_sorted_unique_data();
+            let mut builder =
+                BlockBuilder::new(options.comparator.clone(), options.block_restart_interval);
+            for (key, val) in data.iter() {
+                builder.add(key.as_slice().into(), val.as_slice().into());
+            }
+            *kvs = data;
+            let block_data = builder.finish();
+            let mut content = BlockContent::default();
+            content.data.extend_from_slice(block_data.as_ref());
+            content.cachable = false;
+            content.heap_allocted = true;
+            let block = Block::from_content(content).unwrap();
+            self.block = Some(block);
+        }
+
+        fn new_iterator<'a>(&'a self) -> Box<dyn MyIter + 'a> {
+            let block = self.block.as_ref().unwrap();
+            Box::new(block.new_iterator(self.comparator.clone()))
+        }
+
+        fn add(&mut self, key: Vec<u8>, val: Vec<u8>) {
+            self.constructor_data.add(key, val);
+        }
+    }
+
+    struct TableConstructor {
+        pub constructor_data: ConstructorData,
+        file: MemFile,
+        table: Option<Table<MemFile>>,
+    }
+
+    impl TableConstructor {
+        pub fn new(comparator: Arc<dyn Comparator<Slice>>) -> Self {
+            TableConstructor {
+                file: MemFile::new(),
+                table: None,
+                constructor_data: ConstructorData {
+                    comparator,
+                    data: Vec::new(),
+                },
+            }
+        }
+
+        pub fn approximate_offset_of(&self, key: Slice) -> u64 {
+            let table = self.table.as_ref().unwrap();
+            table.approximate_offset_of(key)
+        }
+    }
+
+    impl MaterialBuilder for TableConstructor {
+        fn finish(&mut self, options: Arc<Options>, kvs: &mut Vec<(KVBytes, KVBytes)>) {
+            let data = self.constructor_data.get_sorted_unique_data();
+            self.file.clear();
+            self.table = None;
+            let mut builder = TableBuilder::new(options.clone(), self.file.clone());
+            for (key, val) in data.iter() {
+                builder
+                    .add(key.as_slice().into(), val.as_slice().into())
+                    .unwrap();
+            }
+            *kvs = data;
+            builder.finish(true).unwrap();
+            assert_eq!(
+                self.file.content.borrow().len(),
+                builder.file_size() as usize
+            );
+            let mut table_options = Options::default();
+            table_options.comparator = options.comparator.clone();
+            let table = Table::open(
+                Arc::new(table_options),
+                self.file.clone(),
+                self.file.content.borrow().len() as u64,
+            )
+            .unwrap();
+            self.table = Some(table);
+        }
+
+        fn new_iterator<'a>(&'a self) -> Box<dyn MyIter + 'a> {
+            let table = self.table.as_ref().unwrap();
+            let read_option = ReadOption::default();
+            Box::new(table.new_iterator(&read_option))
+        }
+
+        fn add(&mut self, key: Vec<u8>, val: Vec<u8>) {
+            self.constructor_data.add(key, val);
+        }
+    }
+
+    struct KeyConvertingIterator<'a> {
+        inner_iter: Box<dyn MyIter + 'a>,
+        status: Option<StatusError>,
+    }
+
+    // A helper class that converts internal format keys into user keys
+    impl<'a> MyIter for KeyConvertingIterator<'a> {
+        fn valid(&self) -> bool {
+            self.inner_iter.valid()
+        }
+
+        fn seek_to_first(&mut self) {
+            self.inner_iter.seek_to_first()
+        }
+
+        fn seek_to_last(&mut self) {
+            self.inner_iter.seek_to_last()
+        }
+
+        fn seek(&mut self, target: Slice) {
+            let ikey = ParsedInternalKey {
+                user_key: target,
+                sequence: MAX_SEQUENCE_NUMBER,
+                val_type: TYPE_VALUE,
+            };
+            let mut encoded = Vec::new();
+            append_internal_key(&mut encoded, &&ikey);
+            self.inner_iter.seek(encoded.as_slice().into());
+        }
+
+        fn next(&mut self) {
+            self.inner_iter.next();
+        }
+
+        fn prev(&mut self) {
+            self.inner_iter.prev();
+        }
+
+        fn key(&self) -> Slice {
+            let k = self.inner_iter.key();
+            let mut internal_key = ParsedInternalKey::default();
+            if !parse_internal_key(k, &mut internal_key) {
+                b"corrupted key".as_ref().into()
+            } else {
+                internal_key.user_key
+            }
+        }
+
+        fn value(&self) -> Slice {
+            self.inner_iter.value()
+        }
+
+        fn status(&mut self) -> Result<()> {
+            if self.status.is_none() {
+                self.inner_iter.status()
+            } else {
+                Err(self.status.take().unwrap())
+            }
+        }
+    }
+
+    struct MemTableConstructor {
+        pub constructor_data: ConstructorData,
+        memtable: Option<MemTable>,
+        internal_key_comparator: InternalKeyComparator,
+    }
+
+    impl MemTableConstructor {
+        pub fn new(cmp: Arc<dyn Comparator<Slice>>) -> Self {
+            MemTableConstructor {
+                constructor_data: ConstructorData {
+                    data: Vec::new(),
+                    comparator: cmp.clone(),
+                },
+                internal_key_comparator: InternalKeyComparator::new(cmp),
+                memtable: None,
+            }
+        }
+    }
+
+    impl MaterialBuilder for MemTableConstructor {
+        fn finish(&mut self, options: Arc<Options>, kvs: &mut Vec<(KVBytes, KVBytes)>) {
+            let data = self.constructor_data.get_sorted_unique_data();
+            self.memtable = None;
+            let mem = MemTable::new(self.internal_key_comparator.clone());
+            for (i, kv) in data.iter().enumerate() {
+                mem.add(
+                    (i + 1) as u64,
+                    TYPE_VALUE,
+                    &kv.0.as_slice().into(),
+                    &kv.1.as_slice().into(),
+                );
+            }
+            self.memtable = Some(mem);
+            *kvs = data;
+        }
+
+        fn new_iterator<'a>(&'a self) -> Box<dyn MyIter + 'a> {
+            let mem_iter = self.memtable.as_ref().unwrap().iter();
+            let convert_iter = KeyConvertingIterator {
+                inner_iter: mem_iter,
+                status: None,
+            };
+            Box::new(convert_iter)
+        }
+
+        fn add(&mut self, key: Vec<u8>, val: Vec<u8>) {
+            self.constructor_data.add(key, val);
+        }
+    }
+
+    fn inc_until(mut n: i64, bound: i64) -> i64 {
+        n += 1;
+        if n > bound {
+            bound
+        } else {
+            n
+        }
+    }
+
+    // TODO: add db test constructor
+
+    #[derive(Copy, Clone)]
+    enum TestType {
+        TableTest,
+        BlockTest,
+        MemTableTest,
+        DBTest,
+    }
+
+    struct HarnessTester {
+        options: Arc<Options>,
+        constructor: Option<Box<dyn MaterialBuilder>>,
+    }
+
+    impl HarnessTester {
+        pub fn new() -> Self {
+            HarnessTester {
+                options: Arc::new(Options::default()),
+                constructor: None,
+            }
+        }
+
+        pub fn init(&mut self, test_type: TestType, reverse_compare: bool, restart_interval: u32) {
+            let mut options = Options::default();
+            options.block_restart_interval = restart_interval;
+            options.block_size = 256;
+            if reverse_compare {
+                options.comparator = Arc::new(ReverseKeyComparator {});
+            }
+            match test_type {
+                TestType::BlockTest => {
+                    self.constructor =
+                        Some(Box::new(BlockConstructor::new(options.comparator.clone())))
+                }
+                TestType::TableTest => {
+                    self.constructor =
+                        Some(Box::new(TableConstructor::new(options.comparator.clone())))
+                }
+                TestType::MemTableTest => {
+                    self.constructor = Some(Box::new(MemTableConstructor::new(
+                        options.comparator.clone(),
+                    )))
+                }
+                TestType::DBTest => unimplemented!(),
+            }
+            self.options = Arc::new(options);
+        }
+
+        pub fn add(&mut self, key: KVBytes, val: KVBytes) {
+            let constructor = self.constructor.as_mut().unwrap();
+            constructor.add(key, val);
+        }
+
+        pub fn test(&mut self) {
+            let mut kvs = Vec::new();
+            let constructor = self.constructor.as_mut().unwrap();
+            constructor.finish(self.options.clone(), &mut kvs);
+
+            self.test_forward_scan(&kvs);
+            self.test_backward_scan(&kvs);
+            self.test_random_access(&kvs);
+        }
+
+        pub fn test_forward_scan(&self, kvs: &Vec<(KVBytes, KVBytes)>) {
+            let constructor = self.constructor.as_ref().unwrap();
+            let mut iter = constructor.new_iterator();
+            iter.seek_to_first();
+            for (key, val) in kvs.iter() {
+                assert!(iter.valid());
+                assert_eq!(
+                    Self::kv_string(key.as_slice(), val.as_slice()),
+                    Self::kv_string(iter.key().as_ref(), iter.value().as_ref())
+                );
+                iter.next();
+            }
+        }
+
+        pub fn test_backward_scan(&self, kvs: &Vec<(KVBytes, KVBytes)>) {
+            let constructor = self.constructor.as_ref().unwrap();
+            let mut iter = constructor.new_iterator();
+            iter.seek_to_last();
+            for (key, val) in kvs.iter().rev() {
+                assert!(iter.valid());
+                assert_eq!(
+                    Self::kv_string(key.as_slice(), val.as_slice()),
+                    Self::kv_string(iter.key().as_ref(), iter.value().as_ref())
+                );
+                iter.prev();
+            }
+        }
+
+        pub fn test_random_access(&self, kvs: &Vec<(KVBytes, KVBytes)>) {
+            let constructor = self.constructor.as_ref().unwrap();
+            let mut iter = constructor.new_iterator();
+            let mut model_pos: i64 = 0;
+            let n = kvs.len() as i64;
+            assert!(!iter.valid());
+            let mut rand = thread_rng();
+            for _ in 0..200 {
+                let toss = rand.gen_range(0, 5);
+                match toss {
+                    0 => {
+                        if iter.valid() {
+                            iter.next();
+                            model_pos = inc_until(model_pos, n);
+                            self.check_iter(&iter, &kvs, model_pos);
+                        }
+                    }
+
+                    1 => {
+                        iter.seek_to_first();
+                        //assert!(iter.valid());
+                        model_pos = 0;
+                        self.check_iter(&iter, &kvs, model_pos);
+                    }
+
+                    2 => {
+                        let key = self.pick_random_key(&mut rand, &kvs);
+                        iter.seek(key.as_slice().into());
+                        model_pos = -1;
+                        for (i, k) in kvs.iter().enumerate() {
+                            if self
+                                .options
+                                .comparator
+                                .compare(&k.0.as_slice().into(), &key.as_slice().into())
+                                == Ordering::Equal
+                                || self
+                                    .options
+                                    .comparator
+                                    .compare(&k.0.as_slice().into(), &key.as_slice().into())
+                                    == Ordering::Greater
+                            {
+                                model_pos = i as i64;
+                                break;
+                            }
+                        }
+
+                        self.check_iter(&iter, &kvs, model_pos);
+                    }
+
+                    3 => {
+                        if iter.valid() {
+                            iter.prev();
+                            // Wrap around to invalid value
+                            model_pos -= 1;
+                            self.check_iter(&iter, &kvs, model_pos);
+                        }
+                    }
+
+                    4 => {
+                        iter.seek_to_last();
+                        model_pos = kvs.len() as i64 - 1;
+                        self.check_iter(&iter, &kvs, model_pos);
+                    }
+
+                    _ => panic!("impossible"),
+                }
+            }
+        }
+
+        fn check_iter<'a>(
+            &'a self,
+            iter1: &'a Box<dyn MyIter + 'a>,
+            kvs: &Vec<(KVBytes, KVBytes)>,
+            model_pos: i64,
+        ) {
+            if !iter1.valid() {
+                assert!(model_pos < 0 || model_pos as usize >= kvs.len());
+            } else {
+                assert!(model_pos >= 0 && model_pos < kvs.len() as i64);
+                let (model_key, model_val) = kvs.get(model_pos as usize).unwrap();
+                assert_eq!(
+                    Self::kv_string(iter1.key().as_ref(), iter1.value().as_ref()),
+                    Self::kv_string(model_key.as_slice(), model_val.as_slice())
+                );
+            }
+        }
+
+        fn kv_string(k: &[u8], v: &[u8]) -> String {
+            let mut res = String::new();
+            let ks = String::from_utf8_lossy(k);
+            let vs = String::from_utf8_lossy(v);
+            res.push_str(ks.as_ref());
+            res.push_str(vs.as_ref());
+            res
+        }
+
+        fn pick_random_key(&self, rng: &mut ThreadRng, kvs: &Vec<(KVBytes, KVBytes)>) -> Vec<u8> {
+            let mut res = Vec::new();
+            if kvs.is_empty() {
+                res.extend_from_slice(b"foo");
+            } else {
+                let index = rng.gen_range(0, kvs.len());
+                res.extend_from_slice(kvs[index].0.as_slice());
+                match rng.gen_range(0, 2) {
+                    0 => {}
+                    // Return an existing key
+                    1 => {
+                        // Attempt to return something smaller than an existing key
+                        let len = res.len();
+                        if !res.is_empty() && res[len - 1] > 0 {
+                            res[len - 1] -= 1;
+                        }
+                    }
+
+                    2 => {
+                        increment(self.options.comparator.clone(), &mut res);
+                    }
+
+                    _ => panic!("impossible"),
+                }
+            }
+
+            res
+        }
+    }
+
+    const TEST_ARGS: &[(TestType, bool, u32)] = &[
+        (TestType::TableTest, false, 16),
+        (TestType::TableTest, false, 1),
+        (TestType::TableTest, false, 1024),
+        (TestType::TableTest, true, 16),
+        (TestType::TableTest, true, 1),
+        (TestType::TableTest, true, 1024),
+        (TestType::BlockTest, false, 16),
+        (TestType::BlockTest, false, 1),
+        (TestType::BlockTest, false, 1024),
+        (TestType::BlockTest, true, 16),
+        (TestType::BlockTest, true, 1),
+        (TestType::BlockTest, true, 1024),
+        // Restart interval does not matter for memtables
+        (TestType::MemTableTest, false, 16),
+        (TestType::MemTableTest, true, 16),
+        //TODO: add DB test
+    ];
+
+    // Test empty table/block.
+    #[test]
+    fn test_empty() {
+        for (test_type, reverse, restart_interval) in TEST_ARGS {
+            let mut tester = HarnessTester::new();
+            tester.init(*test_type, *reverse, *restart_interval);
+            tester.test();
+        }
+    }
+
+    // Test the empty key
+    #[test]
+    fn test_simple_empty_key() {
+        for (test_type, reverse, restart_interval) in TEST_ARGS {
+            let mut tester = HarnessTester::new();
+            tester.init(*test_type, *reverse, *restart_interval);
+            tester.add(b"".to_vec(), b"v".to_vec());
+            tester.test();
+        }
+    }
+
+    #[test]
+    fn test_simple_single() {
+        for (test_type, reverse, restart_interval) in TEST_ARGS {
+            let mut tester = HarnessTester::new();
+            tester.init(*test_type, *reverse, *restart_interval);
+            tester.add(b"abc".to_vec(), b"v".to_vec());
+            tester.test();
+        }
+    }
+
+    #[test]
+    fn test_simple_multi() {
+        for (test_type, reverse, restart_interval) in TEST_ARGS {
+            let mut tester = HarnessTester::new();
+            tester.init(*test_type, *reverse, *restart_interval);
+            tester.add(b"abc".to_vec(), b"v".to_vec());
+            tester.add(b"abcd".to_vec(), b"v".to_vec());
+            tester.add(b"ac".to_vec(), b"v2".to_vec());
+            tester.test();
+        }
+    }
+
+    #[test]
+    fn test_simple_special_key() {
+        for (test_type, reverse, restart_interval) in TEST_ARGS {
+            let mut tester = HarnessTester::new();
+            tester.init(*test_type, *reverse, *restart_interval);
+            tester.add(b"\xff\xff".to_vec(), b"v3".to_vec());
+            tester.test();
+        }
+    }
+
+    #[test]
+    fn test_randomize() {
+        for (test_type, reverse, restart_interval) in TEST_ARGS {
+            let mut tester = HarnessTester::new();
+            tester.init(*test_type, *reverse, *restart_interval);
+
+            let mut rng = thread_rng();
+            let mut num_entries = 0;
+            while num_entries < 2000 {
+                for _ in 0..num_entries {
+                    let skew = rng.gen_range(0, 5);
+                    let key_len = rng.gen_range(0, 1 << skew);
+                    let key = random_key(&mut rng, key_len);
+
+                    let skew = rng.gen_range(0, 6);
+                    let val_len = rng.gen_range(0, 1 << skew);
+                    let val = random_vec_str(&mut rng, val_len);
+
+                    tester.add(key, val);
+                }
+
+                num_entries = if num_entries < 50 {
+                    num_entries + 1
+                } else {
+                    num_entries + 50
+                }
+            }
+
+            tester.test();
+        }
+    }
+
+    #[test]
+    fn test_memtable_simple() {
+        let internal_key_comparator = InternalKeyComparator::new(Arc::new(BitWiseComparator {}));
+        let memtable = Arc::new(MemTable::new(internal_key_comparator));
+        let mut batch = WriteBatch::new();
+        batch.set_sequence(100);
+
+        let kvs = vec![
+            (b"k1".as_ref(), b"v1".as_ref()),
+            (b"k2".as_ref(), b"v2".as_ref()),
+            (b"k3".as_ref(), b"v3".as_ref()),
+            (b"k4".as_ref(), b"v4".as_ref()),
+            (b"k5".as_ref(), b"v5".as_ref()),
+            (b"k6".as_ref(), b"v6".as_ref()),
+        ];
+        for (k, v) in kvs.iter() {
+            batch.put((*k).into(), (*v).into());
+        }
+
+        batch.insert_into(memtable.clone()).unwrap();
+
+        let mut iter = memtable.iter();
+        let mut iter = KeyConvertingIterator {
+            inner_iter: iter,
+            status: None,
+        };
+
+        iter.seek_to_first();
+        for (k, v) in kvs.iter() {
+            assert!(iter.valid());
+            assert_eq!(*k, iter.key().as_ref());
+            assert_eq!(*v, iter.value().as_ref());
+            iter.next();
+        }
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_table_approximate_offset_of_plain() {
+        let mut options = Options::default();
+        options.compression_type = NO_COMPRESSION;
+
+        let mut constructor = TableConstructor::new(options.comparator.clone());
+        constructor.add(b"k01".as_ref().to_vec(), b"hello".as_ref().to_vec());
+        constructor.add(b"k02".as_ref().to_vec(), b"hello2".as_ref().to_vec());
+
+        let mut repeated_val = Vec::with_capacity(10000);
+        repeated_val.resize(10000, 'x' as u8);
+        constructor.add(b"k03".as_ref().to_vec(), repeated_val);
+
+        let mut repeated_val = Vec::with_capacity(200000);
+        repeated_val.resize(200000, 'x' as u8);
+        constructor.add(b"k04".as_ref().to_vec(), repeated_val);
+
+        let mut repeated_val = Vec::with_capacity(300000);
+        repeated_val.resize(300000, 'x' as u8);
+        constructor.add(b"k05".as_ref().to_vec(), repeated_val);
+
+        constructor.add(b"k06".as_ref().to_vec(), b"hello3".as_ref().to_vec());
+
+        let mut repeated_val = Vec::with_capacity(100000);
+        repeated_val.resize(100000, 'x' as u8);
+        constructor.add(b"k07".as_ref().to_vec(), repeated_val);
+
+        let mut kvs = Vec::new();
+        constructor.finish(Arc::new(options), &mut kvs);
+
+        let table = constructor.table.as_ref().unwrap();
+        let offset = table.approximate_offset_of(b"abc".as_ref().into());
+        assert_eq!(0, offset);
+        let offset = table.approximate_offset_of(b"k01".as_ref().into());
+        assert_eq!(0, offset);
+        let offset = table.approximate_offset_of(b"k01a".as_ref().into());
+        assert_eq!(0, offset);
+        let offset = table.approximate_offset_of(b"k02".as_ref().into());
+        assert_eq!(0, offset);
+        let offset = table.approximate_offset_of(b"k03".as_ref().into());
+        assert_eq!(0, offset);
+        let offset = table.approximate_offset_of(b"k04".as_ref().into());
+        assert!(offset >= 10000 && offset <= 11000);
+        let offset = table.approximate_offset_of(b"k04a".as_ref().into());
+        assert!(offset >= 210000 && offset <= 211000);
+        let offset = table.approximate_offset_of(b"k05".as_ref().into());
+        assert!(offset >= 210000 && offset <= 211000);
+        let offset = table.approximate_offset_of(b"k06".as_ref().into());
+        assert!(offset >= 510000 && offset <= 511000);
+        let offset = table.approximate_offset_of(b"k07".as_ref().into());
+        assert!(offset >= 510000 && offset <= 511000);
+        let offset = table.approximate_offset_of(b"xyz".as_ref().into());
+        assert!(offset >= 610000 && offset <= 611000);
+    }
+
+    #[test]
+    fn test_table_approximate_offset_of_compressed() {
+        let mut options = Options::default();
+        let mut rnd = thread_rng();
+        let mut constructor = TableConstructor::new(options.comparator.clone());
+
+        constructor.add(b"k01".as_ref().to_vec(), b"hello".as_ref().to_vec());
+        constructor.add(
+            b"k02".as_ref().to_vec(),
+            compressible_vec_str(&mut rnd, 0.25, 10000),
+        );
+        constructor.add(b"k03".as_ref().to_vec(), b"hello3".as_ref().to_vec());
+        constructor.add(
+            b"k04".as_ref().to_vec(),
+            compressible_vec_str(&mut rnd, 0.25, 10000),
+        );
+
+        let mut kvs = Vec::new();
+        constructor.finish(Arc::new(options), &mut kvs);
+
+        // Expected upper and lower bounds of space used by compressible strings.
+        let slop = 1000; // Compressor effectiveness varies.
+        let expect = 2500; // 10000 * compression ratio (0.25)
+        let min_z = expect - slop;
+        let max_z = expect + slop;
+
+        let table = constructor.table.as_ref().unwrap();
+        let offset = table.approximate_offset_of(b"abc".as_ref().into());
+        assert!(offset <= slop);
+        let offset = table.approximate_offset_of(b"k01".as_ref().into());
+        assert!(offset <= slop);
+        let offset = table.approximate_offset_of(b"k02".as_ref().into());
+        assert!(offset <= slop);
+        let offset = table.approximate_offset_of(b"k03".as_ref().into());
+        assert!(offset >= min_z && offset <= max_z);
+        let offset = table.approximate_offset_of(b"k04".as_ref().into());
+        assert!(offset >= min_z && offset <= max_z);
+        let offset = table.approximate_offset_of(b"xyz".as_ref().into());
+        assert!(offset >= 2 * min_z && offset <= 2 * max_z);
+    }
 }

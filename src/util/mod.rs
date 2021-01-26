@@ -6,3 +6,4 @@ pub mod cmp;
 pub mod coding;
 pub mod filter;
 pub mod hash;
+pub mod testutil;

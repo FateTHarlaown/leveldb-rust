@@ -53,10 +53,9 @@ impl BlockHandle {
         put_varint64(dst, self.size);
     }
 
-    pub fn decode_from(&mut self, input: Slice) -> Result<()> {
-        let mut data = input.as_ref();
-        self.offset = data.decode_varint64()?;
-        self.size = data.decode_varint64()?;
+    pub fn decode_from(&mut self, input: &mut &[u8]) -> Result<()> {
+        self.offset = input.decode_varint64()?;
+        self.size = input.decode_varint64()?;
         Ok(())
     }
 }
@@ -102,18 +101,18 @@ impl Footer {
     }
 
     pub fn decoded_from(&mut self, input: Slice) -> Result<()> {
-        let buf = input.as_ref();
+        let mut buf = input.as_ref();
         let mut magic_buf = buf[FOOTER_ENCODED_LENGTH - 8..].as_ref();
-        let magic_lo = magic_buf.decode_varint32().unwrap();
-        let magic_hi = magic_buf.decode_varint32().unwrap();
+        let magic_lo = magic_buf.read_u32::<LittleEndian>().unwrap();
+        let magic_hi = magic_buf.read_u32::<LittleEndian>().unwrap();
         let magic = (magic_hi as u64) << 32 | magic_lo as u64;
         if magic != TABLE_MAGIC_NUMBER {
             return Err(StatusError::Corruption(
                 "not an sstable (bad magic number)".to_string(),
             ));
         }
-        self.meta_index_handle.decode_from(input)?;
-        self.index_handle.decode_from(input)?;
+        self.meta_index_handle.decode_from(&mut buf)?;
+        self.index_handle.decode_from(&mut buf)?;
         Ok(())
     }
 }
