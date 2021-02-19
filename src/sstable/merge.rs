@@ -8,14 +8,7 @@ use std::rc::Rc;
 const FORWARD: u8 = 0;
 const BACKWARD: u8 = 1;
 
-pub fn new_merging_iterator<C: Comparator<Slice> + 'static>(
-    comparator: C,
-    children: Vec<Box<dyn Iterator>>,
-) -> Box<dyn Iterator> {
-    Box::new(MergingIterator::new(comparator, children))
-}
-
-struct MergingIterator<C: Comparator<Slice>> {
+pub(crate) struct MergingIterator<C: Comparator<Slice>> {
     children: Vec<Box<dyn Iterator>>,
     current: Option<usize>,
     comparator: C,

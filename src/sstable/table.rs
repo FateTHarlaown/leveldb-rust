@@ -145,11 +145,14 @@ impl<R: RandomAccessFile> Table<R> {
         }
     }
 
-    pub fn new_iterator<'a>(&'a self, option: &ReadOption) -> impl Iterator + 'a {
-        let index_iter = self
+    pub(crate) fn new_iterator(
+        table: Arc<Table<R>>,
+        option: &ReadOption,
+    ) -> TwoLevelIterator<BlockIter, TableBlockIterBuilder<R>> {
+        let index_iter = table
             .index_block
-            .new_iterator(self.options.comparator.clone());
-        let block_iter_builder = TableBlockIterBuilder { table: self };
+            .new_iterator(table.options.comparator.clone());
+        let block_iter_builder = TableBlockIterBuilder { table };
         TwoLevelIterator::new(index_iter, block_iter_builder, option.clone())
     }
 
@@ -226,11 +229,11 @@ impl<R: RandomAccessFile> Table<R> {
     }
 }
 
-struct TableBlockIterBuilder<'a, R: RandomAccessFile> {
-    table: &'a Table<R>,
+pub(crate) struct TableBlockIterBuilder<R: RandomAccessFile> {
+    table: Arc<Table<R>>,
 }
 
-impl<'a, R: RandomAccessFile> BlockIterBuilder for TableBlockIterBuilder<'a, R> {
+impl<R: RandomAccessFile> BlockIterBuilder for TableBlockIterBuilder<R> {
     type Iter = BlockIter;
     fn build(&self, option: &ReadOption, index_val: Slice) -> Result<Self::Iter> {
         self.table.block_iter_from_index(option, index_val)
@@ -745,7 +748,7 @@ mod tests {
     struct TableConstructor {
         pub constructor_data: ConstructorData,
         file: MemFile,
-        table: Option<Table<MemFile>>,
+        table: Option<Arc<Table<MemFile>>>,
     }
 
     impl TableConstructor {
@@ -791,13 +794,13 @@ mod tests {
                 self.file.content.borrow().len() as u64,
             )
             .unwrap();
-            self.table = Some(table);
+            self.table = Some(Arc::new(table));
         }
 
         fn new_iterator<'a>(&'a self) -> Box<dyn MyIter + 'a> {
             let table = self.table.as_ref().unwrap();
             let read_option = ReadOption::default();
-            Box::new(table.new_iterator(&read_option))
+            Box::new(Table::new_iterator(table.clone(), &read_option))
         }
 
         fn add(&mut self, key: Vec<u8>, val: Vec<u8>) {

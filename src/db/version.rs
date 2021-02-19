@@ -6,7 +6,7 @@ use crate::db::dbformat::{TYPE_DELETION, TYPE_VALUE};
 use crate::db::error::{Result, StatusError};
 use crate::db::slice::Slice;
 use crate::db::table_cache::TableCache;
-use crate::db::{ReadOption, Reporter};
+use crate::db::{Iterator, RandomAccessFile, ReadOption, Reporter};
 
 use crate::env::{read_file_to_vec, Env};
 use crate::util::cache::Cache;
@@ -19,7 +19,12 @@ use crate::db::option::Options;
 use crate::util::buffer::BufferReader;
 use crate::util::coding::{put_varint32, put_varint64, DecodeVarint, VarLengthSliceReader};
 
+use crate::sstable::block::BlockIter;
+use crate::sstable::table::{Table, TableBlockIterBuilder};
+use crate::sstable::two_level_iterator::{BlockIterBuilder, TwoLevelIterator};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::cell::RefCell;
+use std::cell::UnsafeCell;
 use std::cmp::Ordering;
 use std::collections::hash_set::Difference;
 use std::collections::linked_list::LinkedList;
@@ -366,6 +371,128 @@ impl<E: Env> Version<E> {
         } else {
             false
         }
+    }
+
+    pub(crate) fn new_concatenating_iter(
+        &self,
+        options: &ReadOption,
+        level: usize,
+    ) -> TwoLevelIterator<LevelFileNumIterator, LevelTableIterBuilder<E>> {
+        let tables = self.files.get(level).unwrap();
+        let index_iter = LevelFileNumIterator::new(self.icmp.clone(), tables.clone());
+        let builder = LevelTableIterBuilder {
+            table_cache: self.table_cache.clone(),
+        };
+        TwoLevelIterator::new(index_iter, builder, options.clone())
+    }
+
+    pub(crate) fn add_iterators(
+        &self,
+        options: &ReadOption,
+        iters: &mut Vec<Box<dyn Iterator>>,
+    ) -> Result<()> {
+        for file in self.files[0].iter() {
+            let table = self.table_cache.find_table(file.number, file.file_size)?;
+            let iter = Table::new_iterator(table, options);
+            iters.push(Box::new(iter));
+        }
+
+        for i in 1..self.files.len() {
+            let iter = self.new_concatenating_iter(options, i);
+            iters.push(Box::new(iter));
+        }
+
+        Ok(())
+    }
+}
+
+// An internal iterator.  For a given version/level pair, yields
+// information about the files in the level.  For a given entry, key()
+// is the largest key that occurs in the file, and value() is an
+// 16-byte value containing the file number and file size, both
+// encoded using EncodeFixed64.
+pub(crate) struct LevelFileNumIterator {
+    icmp: InternalKeyComparator,
+    file_list: Vec<Arc<FileMetaData>>,
+    index: usize,
+    value_buf: UnsafeCell<[u8; 16]>,
+}
+
+impl LevelFileNumIterator {
+    pub fn new(icmp: InternalKeyComparator, file_list: Vec<Arc<FileMetaData>>) -> Self {
+        let index = file_list.len();
+        LevelFileNumIterator {
+            icmp,
+            file_list,
+            index,
+            value_buf: UnsafeCell::new([0; 16]),
+        }
+    }
+}
+
+impl Iterator for LevelFileNumIterator {
+    fn valid(&self) -> bool {
+        self.index < self.file_list.len()
+    }
+
+    fn seek_to_first(&mut self) {
+        self.index = 0;
+    }
+
+    fn seek_to_last(&mut self) {
+        self.index = if self.file_list.is_empty() {
+            0
+        } else {
+            self.file_list.len() - 1
+        }
+    }
+
+    fn seek(&mut self, target: Slice) {
+        self.index = find_file(&self.icmp, &self.file_list, target)
+    }
+
+    fn next(&mut self) {
+        self.index += 1;
+    }
+
+    fn prev(&mut self) {
+        self.index -= 1;
+    }
+
+    fn key(&self) -> Slice {
+        self.file_list[self.index].largest.encode()
+    }
+
+    fn value(&self) -> Slice {
+        let num = self.file_list[self.index].number;
+        let size = self.file_list[self.index].file_size;
+        unsafe {
+            let mut buf = &mut *self.value_buf.get();
+            let mut write_buf = buf.as_mut();
+            write_buf.write_u64::<LittleEndian>(num);
+            write_buf.write_u64::<LittleEndian>(size);
+            buf.as_ref().into()
+        }
+    }
+
+    fn status(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) struct LevelTableIterBuilder<E: Env> {
+    table_cache: TableCache<E>,
+}
+
+impl<E: Env> BlockIterBuilder for LevelTableIterBuilder<E> {
+    type Iter = TwoLevelIterator<BlockIter, TableBlockIterBuilder<E::RndFile>>;
+
+    fn build(&self, option: &ReadOption, index_val: Slice) -> Result<Self::Iter> {
+        let mut buf = index_val.as_ref();
+        let file_num = buf.read_u64::<LittleEndian>().unwrap();
+        let file_size = buf.read_u64::<LittleEndian>().unwrap();
+        let table = self.table_cache.find_table(file_num, file_size)?;
+        Ok(Table::new_iterator(table, option))
     }
 }
 

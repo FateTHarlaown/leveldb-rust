@@ -9,6 +9,7 @@ use crate::util::arena::Arena;
 use crate::util::cmp::Comparator;
 use std::cell::RefCell;
 use std::cmp;
+use std::sync::Arc;
 
 // max height for skip list
 const MAX_HEIGHT: usize = 12;
@@ -91,13 +92,13 @@ impl<K> Node<K> {
     }
 }
 
-pub struct SkipListIterator<'a, K> {
-    skip_list: &'a SkipList<K>,
+pub struct SkipListIterator<K> {
+    skip_list: Arc<SkipList<K>>,
     node: *const Node<K>,
 }
 
-impl<'a, K> SkipListIterator<'a, K> {
-    pub fn new(skip_list: &'a SkipList<K>) -> Self {
+impl<K> SkipListIterator<K> {
+    pub fn new(skip_list: Arc<SkipList<K>>) -> Self {
         SkipListIterator {
             skip_list,
             node: ptr::null(),
@@ -366,10 +367,10 @@ mod tests {
 
     #[test]
     fn test_empty() {
-        let list = new_list();
+        let list = Arc::new(new_list());
         assert!(!list.contains(&10));
 
-        let mut iter = SkipListIterator::new(&list);
+        let mut iter = SkipListIterator::new(list);
         assert!(!iter.valid());
         iter.seek_to_first();
         assert!(!iter.valid());
@@ -384,7 +385,7 @@ mod tests {
         let (n, r) = (2000 as u64, 5000 as u64);
         let mut rnd = thread_rng();
         let mut keys = BTreeSet::new();
-        let list = new_list();
+        let list = Arc::new(new_list());
         for _ in 0..n {
             let key = rnd.gen_range(0, r);
             if keys.insert(key) {
@@ -398,7 +399,7 @@ mod tests {
 
         // Simple iterator tests
         {
-            let mut iter = SkipListIterator::new(&list);
+            let mut iter = SkipListIterator::new(list.clone());
             assert!(!iter.valid());
 
             iter.seek(&0);
@@ -416,7 +417,7 @@ mod tests {
 
         // Forward iteration test
         for i in 0..r {
-            let mut iter = SkipListIterator::new(&list);
+            let mut iter = SkipListIterator::new(list.clone());
             iter.seek(&i);
 
             let mut model_iter = keys.iter().filter(|&&k| k >= i);
@@ -435,7 +436,7 @@ mod tests {
 
         // Backward iteration test
         {
-            let mut iter = SkipListIterator::new(&list);
+            let mut iter = SkipListIterator::new(list.clone());
             iter.seek_to_last();
 
             for key in keys.iter().rev() {
@@ -504,7 +505,7 @@ mod tests {
 
     struct ConcurrentTest {
         current: State,
-        list: SkipList<Key>,
+        list: Arc<SkipList<Key>>,
     }
 
     unsafe impl Sync for ConcurrentTest {}
@@ -514,7 +515,7 @@ mod tests {
         pub fn new() -> Self {
             let arena = Rc::new(RefCell::new(Arena::new()));
             let comparator = Rc::new(U64Comparator {});
-            let list = SkipList::new(comparator, arena, 0);
+            let list = Arc::new(SkipList::new(comparator, arena, 0));
             let current = State::new();
             ConcurrentTest { current, list }
         }
@@ -574,7 +575,7 @@ mod tests {
             }
 
             let mut pos = ConcurrentTest::random_target(rnd);
-            let mut iter = SkipListIterator::new(&self.list);
+            let mut iter = SkipListIterator::new(self.list.clone());
             iter.seek(&pos);
             loop {
                 let current = if iter.valid() {

@@ -6,7 +6,7 @@ use crate::db::Iterator;
 use crate::db::Result;
 use crate::db::{Options, ReadOption, WritableFile};
 use crate::env::Env;
-use crate::sstable::table::TableBuilder;
+use crate::sstable::table::{Table, TableBuilder};
 use std::sync::Arc;
 
 pub fn build_table<'a, E: Env>(
@@ -46,7 +46,7 @@ pub fn build_table<'a, E: Env>(
             let res_table = table_cache.find_table(meta.number, meta.file_size);
             if res_table.is_ok() {
                 let mut table = res_table.unwrap();
-                let mut iter = table.new_iterator(&ReadOption::default());
+                let mut iter = Table::new_iterator(table, &ReadOption::default());
                 res = iter.status();
             }
         }

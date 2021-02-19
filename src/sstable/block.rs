@@ -13,7 +13,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 pub struct Block {
-    content: Rc<BlockContent>,
+    content: Arc<BlockContent>,
     restart_offset: u32,
 }
 
@@ -26,7 +26,7 @@ impl Block {
             ))
         } else {
             let mut block = Block {
-                content: Rc::new(content),
+                content: Arc::new(content),
                 restart_offset: 0,
             };
             let max_restart_allowed = (n - mem::size_of::<u32>()) / mem::size_of::<u32>();
@@ -57,7 +57,7 @@ impl Block {
 }
 
 pub struct BlockIter {
-    block_content: Rc<BlockContent>, // underlying block contents
+    block_content: Arc<BlockContent>, // underlying block contents
     comparator: Arc<dyn Comparator<Slice>>,
     restarts: u32,     // Offset of restart array (list of fixed32)
     num_restarts: u32, // Number of uint32_t entries in restart array

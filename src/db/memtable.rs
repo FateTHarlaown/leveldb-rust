@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 pub struct MemTable {
     arena: Rc<RefCell<Arena>>,
-    table: SkipList<Slice>,
+    table: Arc<SkipList<Slice>>,
     comparator: Arc<dyn Comparator<Slice>>,
 }
 
@@ -33,7 +33,11 @@ impl MemTable {
         let key_comparator = KeyComparator {
             comparator: internal_key_comparator,
         };
-        let table = SkipList::new(Rc::new(key_comparator), arena.clone(), Slice::default());
+        let table = Arc::new(SkipList::new(
+            Rc::new(key_comparator),
+            arena.clone(),
+            Slice::default(),
+        ));
         MemTable {
             arena,
             table,
@@ -74,7 +78,7 @@ impl MemTable {
 
     pub fn get(&self, key: &LookupKey) -> Result<Option<Slice>> {
         let mem_key = key.memtable_key();
-        let mut iter = SkipListIterator::new(&self.table);
+        let mut iter = SkipListIterator::new(self.table.clone());
         iter.seek(&mem_key);
         if iter.valid() {
             let mut seek_key_buf = iter.key().as_ref();
@@ -102,18 +106,20 @@ impl MemTable {
         self.arena.borrow().memory_usage()
     }
 
-    pub fn iter(&'a self) -> Box<dyn Iterator + 'a> {
-        Box::new(MemTableIterator::new(SkipListIterator::new(&self.table)))
+    pub fn iter(&self) -> Box<dyn Iterator> {
+        Box::new(MemTableIterator::new(SkipListIterator::new(
+            self.table.clone(),
+        )))
     }
 }
 
-pub struct MemTableIterator<'a> {
-    iter: SkipListIterator<'a, Slice>,
+pub struct MemTableIterator {
+    iter: SkipListIterator<Slice>,
     tmp: Vec<u8>,
 }
 
-impl<'a> MemTableIterator<'a> {
-    pub fn new(iter: SkipListIterator<'a, Slice>) -> Self {
+impl MemTableIterator {
+    pub fn new(iter: SkipListIterator<Slice>) -> Self {
         MemTableIterator {
             iter,
             tmp: Vec::new(),
@@ -121,7 +127,7 @@ impl<'a> MemTableIterator<'a> {
     }
 }
 
-impl<'a> Iterator for MemTableIterator<'a> {
+impl Iterator for MemTableIterator {
     fn valid(&self) -> bool {
         self.iter.valid()
     }

@@ -198,7 +198,6 @@ pub trait DB {
     // Note: consider setting options.sync = true.
     fn delete(&mut self, option: &WriteOption, key: Slice) -> Result<()>;
      */
-
     // If the database contains an entry for "key" store the
     // corresponding value in *value and return OK.
     //
@@ -212,4 +211,6 @@ pub trait DB {
     // Returns OK on success, non-OK on failure.
     // Note: consider setting options.sync = true.
     fn write(&self, options: &WriteOption, updates: Option<WriteBatch>) -> Result<()>;
+
+    fn new_iterator(&self, options: &ReadOption) -> Result<Box<dyn Iterator>>;
 }

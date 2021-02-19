@@ -1,5 +1,8 @@
 use crate::db::builder::build_table;
-use crate::db::dbformat::{InternalKeyComparator, LookupKey, SequenceNumber};
+use crate::db::dbformat::{
+    append_internal_key, extract_user_key, parse_internal_key, InternalKeyComparator, LookupKey,
+    ParsedInternalKey, SequenceNumber, TYPE_DELETION, VALUE_TYPE_FOR_SEEK,
+};
 use crate::db::error::StatusError::NotFound;
 use crate::db::error::{Result, StatusError};
 use crate::db::filename::{
@@ -13,9 +16,12 @@ use crate::db::option::Options;
 use crate::db::table_cache::TableCache;
 use crate::db::version::{CompactionState, FileMetaData, Version, VersionEdit, VersionSet};
 use crate::db::write_batch::WriteBatch;
+use crate::db::Iterator;
 use crate::db::{slice::Slice, ReadOption, Reporter, DB};
 use crate::db::{WritableFile, WriteOption};
 use crate::env::Env;
+use crate::sstable::merge::MergingIterator;
+use crate::util::cmp::Comparator;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use crossbeam_utils::sync::ShardedLock;
 use failure::_core::option::Option::Some;
@@ -171,6 +177,25 @@ impl<E: Env> LevelDB<E> {
     fn run_compaction_worker(&self) {}
 }
 
+/*
+impl<E: Env> DB for LevelDB<E> {
+    fn get(&self, options: &ReadOption, key: Slice, val: &mut Vec<u8>) -> Result<()> {
+
+        Ok(())
+    }
+
+    fn write(&self, options: &WriteOption, updates: Option<WriteBatch>) -> Result<()> {
+
+        Ok(())
+    }
+
+    fn new_iterator(&self, options: &ReadOption) -> Result<dyn Iterator> {
+
+        Ok(())
+    }
+}
+ */
+
 #[derive(Clone)]
 struct LogReporter {
     pub record_status: bool,
@@ -227,7 +252,7 @@ struct Wal<W: WritableFile> {
 unsafe impl<E: Env> Send for DBImplInner<E> {}
 unsafe impl<E: Env> Sync for DBImplInner<E> {}
 
-struct DBImplInner<E: Env> {
+pub(crate) struct DBImplInner<E: Env> {
     dbname: String,
     internal_comparator: InternalKeyComparator,
     env: E,
@@ -629,6 +654,29 @@ impl<E: Env> DBImplInner<E> {
         let mut back_ground_error = self.background_error.write().unwrap();
         back_ground_error.get_or_insert(e);
     }
+
+    fn new_internal_iterator(
+        &self,
+        options: &ReadOption,
+    ) -> Result<(MergingIterator<InternalKeyComparator>, SequenceNumber)> {
+        let versions = self.versions.lock().unwrap();
+        let latest_snapshot = versions.get_last_sequence();
+        let mem = self.mem.read().unwrap();
+        let mut iters = Vec::new();
+        if let Some(m) = mem.as_ref() {
+            iters.push(m.iter());
+        }
+
+        let imm = self.imm.read().unwrap();
+        if let Some(m) = imm.as_ref() {
+            iters.push(m.iter());
+        }
+
+        let current = versions.current();
+        current.add_iterators(options, &mut iters);
+        let merge_iter = MergingIterator::new(self.internal_comparator.clone(), iters);
+        Ok((merge_iter, latest_snapshot))
+    }
 }
 
 fn maybe_ignore_error(res: &mut Result<()>, paranoid_checks: bool) {
@@ -649,4 +697,294 @@ fn clip_to_range<T: PartialOrd + Copy>(source: &mut T, min: &T, max: &T) {
 
 fn table_cache_size(sanitized_options: &Arc<Options>) -> u64 {
     sanitized_options.max_open_files - NUM_NON_TABLE_CACHE_FILES
+}
+
+// Which direction is the iterator currently moving?
+// (1) When moving forward, the internal iterator is positioned at
+//     the exact entry that yields this->key(), this->value()
+// (2) When moving backwards, the internal iterator is positioned
+//     just before all entries whose user key == this->key().
+const FORWARD: u8 = 0;
+const BACKWARD: u8 = 1;
+
+// Memtables and sstables that make the DB representation contain
+// (userkey,seq,type) => uservalue entries.  DBIter
+// combines multiple entries for the same userkey found in the DB
+// representation into a single entry while accounting for sequence
+// numbers, deletion markers, overwrites, etc.
+// TODO: add sample record
+pub(crate) struct DBIter<E: Env> {
+    // TODO: add sample record
+    db: Arc<DBImplInner<E>>,
+    user_comparator: Arc<dyn Comparator<Slice>>,
+    iter: Box<dyn Iterator>,
+    sequence: SequenceNumber,
+    status: Option<StatusError>,
+    saved_key: Vec<u8>,
+    saved_value: Vec<u8>,
+    direction: u8,
+    valid: bool,
+}
+
+impl<E: Env> DBIter<E> {
+    pub(crate) fn new(db: Arc<DBImplInner<E>>, iter: Box<dyn Iterator>, sequence: SequenceNumber) -> Self {
+        let user_comparator = db.internal_comparator.user_comparator();
+        DBIter {
+            db,
+            user_comparator,
+            iter,
+            sequence,
+            status: None,
+            saved_key: Vec::new(),
+            saved_value: Vec::new(),
+            direction: FORWARD,
+            valid: false,
+        }
+    }
+
+    #[inline]
+    fn clear_saved_value(&mut self) {
+        if self.saved_value.capacity() > 1048576 {
+            let mut tmp = Vec::new();
+            std::mem::swap(&mut self.saved_value, &mut tmp);
+        } else {
+            self.saved_value.clear();
+        }
+    }
+
+    #[inline]
+    fn parse_key(&mut self, ikey: &mut ParsedInternalKey) -> bool {
+        let k = self.iter.key();
+        // TODO: add sample and trigger compaction if needed
+        if !parse_internal_key(k, ikey) {
+            self.status = Some(StatusError::Corruption(
+                "corrupted internal key in DBIter".to_string(),
+            ));
+            false
+        } else {
+            true
+        }
+    }
+
+    fn find_next_user_entry(&mut self, mut skipping: bool) {
+        assert!(self.iter.valid());
+        assert_eq!(self.direction, FORWARD);
+        loop {
+            let mut ikey = ParsedInternalKey::default();
+            if self.parse_key(&mut ikey) && ikey.sequence <= self.sequence {
+                if ikey.val_type == TYPE_DELETION {
+                    // Arrange to skip all upcoming entries for this key since
+                    // they are hidden by this deletion.
+                    self.saved_key.clear();
+                    self.saved_key.extend_from_slice(ikey.user_key.as_ref());
+                    skipping = true;
+                } else {
+                    let cmp_res = self
+                        .user_comparator
+                        .compare(&ikey.user_key, &self.saved_key.as_slice().into());
+                    if skipping
+                        && (cmp_res == std::cmp::Ordering::Less
+                            || cmp_res == std::cmp::Ordering::Equal)
+                    {
+                        // Entry hidden
+                    } else {
+                        self.valid = true;
+                        self.saved_key.clear();
+                        return;
+                    }
+                }
+            }
+            self.iter.next();
+            if !self.iter.valid() {
+                break;
+            }
+        }
+        self.saved_key.clear();
+        self.valid = false;
+    }
+
+    fn find_prev_user_entry(&mut self) {
+        assert_eq!(self.direction, BACKWARD);
+        let mut val_type = TYPE_DELETION;
+        if self.iter.valid() {
+            loop {
+                let mut ikey = ParsedInternalKey::default();
+                if self.parse_key(&mut ikey) && ikey.sequence <= self.sequence {
+                    if val_type != TYPE_DELETION
+                        && self
+                            .user_comparator
+                            .compare(&ikey.user_key, &self.saved_key.as_slice().into())
+                            == std::cmp::Ordering::Less
+                    {
+                        break;
+                    }
+                    val_type = ikey.val_type;
+                    if val_type == TYPE_DELETION {
+                        self.saved_key.clear();
+                        self.clear_saved_value();
+                    } else {
+                        let raw_value = self.iter.value();
+                        if self.saved_value.capacity() > raw_value.size() + 1048576 {
+                            let mut empty = Vec::new();
+                            std::mem::swap(&mut self.saved_value, &mut empty);
+                        }
+                        self.saved_key.clear();
+                        let user_key = extract_user_key(self.iter.key());
+                        self.saved_key.extend_from_slice(user_key.as_ref());
+                        self.saved_value.extend_from_slice(raw_value.as_ref());
+                    }
+                }
+                self.iter.prev();
+                if !self.iter.valid() {
+                    break;
+                }
+            }
+        }
+
+        if val_type == TYPE_DELETION {
+            self.valid = false;
+            self.saved_key.clear();
+            self.clear_saved_value();
+        } else {
+            self.valid = true;
+        }
+    }
+}
+
+impl<E: Env> Iterator for DBIter<E> {
+    fn valid(&self) -> bool {
+        self.valid
+    }
+
+    fn seek_to_first(&mut self) {
+        self.direction = FORWARD;
+        self.clear_saved_value();
+        self.iter.seek_to_first();
+        if self.iter.valid() {
+            self.find_next_user_entry(false);
+        } else {
+            self.valid = false;
+        }
+    }
+
+    fn seek_to_last(&mut self) {
+        self.direction = BACKWARD;
+        self.clear_saved_value();
+        self.iter.seek_to_last();
+        self.find_prev_user_entry();
+    }
+
+    fn seek(&mut self, target: Slice) {
+        self.direction = FORWARD;
+        self.clear_saved_value();
+        self.saved_key.clear();
+        let parsed_key = ParsedInternalKey {
+            user_key: target,
+            sequence: self.sequence,
+            val_type: VALUE_TYPE_FOR_SEEK,
+        };
+        append_internal_key(&mut self.saved_key, &parsed_key);
+        self.iter.seek(self.saved_key.as_slice().into());
+        if self.iter.valid() {
+            self.find_next_user_entry(false);
+        } else {
+            self.valid = false;
+        }
+    }
+
+    fn next(&mut self) {
+        assert!(self.valid);
+        if self.direction == BACKWARD {
+            self.direction = FORWARD;
+            // iter_ is pointing just before the entries for this->key(),
+            // so advance into the range of entries for this->key() and then
+            // use the normal skipping code below.
+            if !self.iter.valid() {
+                self.iter.seek_to_first();
+            } else {
+                self.iter.next();
+            }
+
+            if !self.iter.valid() {
+                self.valid = false;
+                self.saved_key.clear();
+                return;
+            }
+            // saved_key_ already contains the key to skip past.
+        } else {
+            // Store in saved_key_ the current key so we skip it below.
+            let user_key = extract_user_key(self.iter.key());
+            self.saved_key.clear();
+            self.saved_key.extend_from_slice(user_key.as_ref());
+            // iter_ is pointing to current key. We can now safely move to the next to
+            // avoid checking current key.
+            self.iter.next();
+            if !self.iter.valid() {
+                self.valid = false;
+                self.saved_key.clear();
+                return;
+            }
+        }
+
+        self.find_next_user_entry(true);
+    }
+
+    fn prev(&mut self) {
+        assert!(self.valid);
+        if self.direction == FORWARD {
+            // iter_ is pointing at the current entry.  Scan backwards until
+            // the key changes so we can use the normal reverse scanning code.
+            // Otherwise valid_ would have been false
+            assert!(self.iter.valid());
+            let user_key = extract_user_key(self.iter.key());
+            self.saved_key.clear();
+            self.saved_key.extend_from_slice(user_key.as_ref());
+            loop {
+                self.iter.prev();
+                if !self.iter.valid() {
+                    self.valid = false;
+                    self.saved_key.clear();
+                    self.clear_saved_value();
+                    return;
+                }
+                let user_key = extract_user_key(self.iter.key());
+                if self
+                    .user_comparator
+                    .compare(&user_key, &self.saved_key.as_slice().into())
+                    == std::cmp::Ordering::Less
+                {
+                    break;
+                }
+            }
+            self.direction = BACKWARD;
+        }
+
+        self.find_prev_user_entry();
+    }
+
+    fn key(&self) -> Slice {
+        assert!(self.valid);
+        if self.direction == FORWARD {
+            extract_user_key(self.iter.key())
+        } else {
+            self.saved_key.as_slice().into()
+        }
+    }
+
+    fn value(&self) -> Slice {
+        assert!(self.valid);
+        if self.direction == FORWARD {
+            self.iter.value()
+        } else {
+            self.saved_value.as_slice().into()
+        }
+    }
+
+    fn status(&mut self) -> Result<()> {
+        if self.status.is_some() {
+            Err(self.status.take().unwrap())
+        } else {
+            self.iter.status()
+        }
+    }
 }
