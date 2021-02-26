@@ -1,4 +1,5 @@
 use crate::db::builder::build_table;
+use crate::db::dbformat::config;
 use crate::db::dbformat::{
     append_internal_key, extract_user_key, parse_internal_key, InternalKeyComparator, LookupKey,
     ParsedInternalKey, SequenceNumber, TYPE_DELETION, VALUE_TYPE_FOR_SEEK,
@@ -22,14 +23,14 @@ use crate::db::{WritableFile, WriteOption};
 use crate::env::Env;
 use crate::sstable::merge::MergingIterator;
 use crate::util::cmp::Comparator;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use crossbeam_utils::sync::ShardedLock;
-use failure::_core::option::Option::Some;
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread;
+use std::time::Duration;
 use std::time::Instant;
 
 const NUM_NON_TABLE_CACHE_FILES: u64 = 10;
@@ -174,7 +175,30 @@ impl<E: Env> LevelDB<E> {
             .unwrap();
     }
 
-    fn run_compaction_worker(&self) {}
+    fn run_compaction_worker(&self) {
+        let inner = self.inner.clone();
+        thread::Builder::new()
+            .name("compaction".to_string())
+            .spawn(move || {
+                while let Ok(()) = inner.compaction_trigger.1.recv() {
+                    if inner.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    if !inner.versions.lock().unwrap().need_compaction()
+                        || inner.background_error.read().unwrap().is_some()
+                        || inner.imm.read().unwrap().is_none()
+                    {
+                    } else {
+                        inner.background_compaction();
+                    }
+
+                    inner.maybe_schedule_compaction();
+                    inner.back_ground_work_finish_signal.notify_all();
+                }
+            })
+            .unwrap();
+    }
 }
 
 /*
@@ -270,6 +294,9 @@ pub(crate) struct DBImplInner<E: Env> {
     // Have we encountered a background error in paranoid mode
     background_error: RwLock<Option<StatusError>>,
     shutdown: AtomicBool,
+
+    compaction_trigger: (Sender<()>, Receiver<()>),
+    back_ground_work_finish_signal: Condvar,
 }
 
 impl<E: Env> DBImplInner<E> {
@@ -300,6 +327,8 @@ impl<E: Env> DBImplInner<E> {
             batch_write_cond: Condvar::new(),
             background_error: RwLock::new(None),
             shutdown: AtomicBool::new(false),
+            compaction_trigger: unbounded(),
+            back_ground_work_finish_signal: Condvar::new(),
         }
     }
 
@@ -525,18 +554,18 @@ impl<E: Env> DBImplInner<E> {
         &self,
         mem: Arc<MemTable>,
         edit: &mut VersionEdit,
-        base: Option<&mut Version<E>>,
+        base: Option<Arc<Version<E>>>,
     ) -> Result<()> {
         let mut versions = self.versions.lock().unwrap();
         let start_time = Instant::now();
         let mut meta = FileMetaData::default();
         meta.number = versions.new_file_number();
         versions.pending_outputs.insert(meta.number);
-        let mut iter = mem.iter();
+        let iter = mem.iter();
 
         // unlock when build table
         std::mem::drop(versions);
-        let mut res = build_table(
+        let res = build_table(
             &self.dbname,
             self.env.clone(),
             &self.options,
@@ -584,7 +613,7 @@ impl<E: Env> DBImplInner<E> {
         new_db.set_last_sequence(0);
 
         let manifest = descriptor_file_name(&self.dbname, 1);
-        let mut file = self.env.new_writable_file(&manifest)?;
+        let file = self.env.new_writable_file(&manifest)?;
         let mut log = LogWriter::new(file);
         let mut record = Vec::new();
         new_db.encode_to(&mut record);
@@ -601,7 +630,17 @@ impl<E: Env> DBImplInner<E> {
 
     fn deleted_obsoleted_files(&self) {}
 
-    fn maybe_schedule_compaction(&self) {}
+    fn maybe_schedule_compaction(&self) {
+        // db is closing
+        if self.shutdown.load(Ordering::Acquire)
+            // Already got an error; no more changes
+            || self.background_error.read().unwrap().is_some()
+        {
+            return;
+        }
+
+        self.compaction_trigger.0.send(()).unwrap();
+    }
 
     fn build_batch_group(&self, first: Writer) -> (WriteBatch, Vec<Sender<Result<()>>>, bool) {
         let sync = first.sync;
@@ -645,9 +684,115 @@ impl<E: Env> DBImplInner<E> {
         (batch, senders, sync)
     }
 
-    fn make_room_for_write(&self, force: bool) -> Result<MutexGuard<VersionSet<E>>> {
+    fn make_room_for_write(&self, mut force: bool) -> Result<MutexGuard<VersionSet<E>>> {
+        #![cfg_attr(feature = "cargo-clippy", allow(clippy::if_same_then_else))]
+        let mut allow_delay = !force;
         let mut versions = self.versions.lock().unwrap();
+        loop {
+            if let Some(e) = self.background_error.write().unwrap().take() {
+                return Err(e);
+            } else if allow_delay
+                && versions.num_level_files(0) >= config::L0_SLOW_DOWN_WRITES_TRIGGER
+            {
+                // We are getting close to hitting a hard limit on the number of
+                // L0 files.  Rather than delaying a single write by several
+                // seconds when we hit the hard limit, start delaying each
+                // individual write by 1ms to reduce latency variance.  Also,
+                // this delay hands over some CPU to the compaction thread in
+                // case it is sharing the same core as the writer.
+                thread::sleep(Duration::from_micros(1000));
+                allow_delay = false;
+            } else if !force
+                && self
+                    .mem
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .approximate_memory_usage()
+                    <= self.options.write_buffer_size
+            {
+                // There is room in current memtable
+                break;
+            } else if self.imm.read().unwrap().is_some() {
+                // We have filled up the current memtable, but the previous
+                // one is still being compacted, so we wait.
+                versions = self.back_ground_work_finish_signal.wait(versions).unwrap();
+            } else if versions.num_level_files(0) >= config::L0_STOP_WRITES_TRIGGER {
+                // There are too many level-0 files.
+                versions = self.back_ground_work_finish_signal.wait(versions).unwrap();
+            } else {
+                // Attempt to switch to a new memtable and trigger compaction of old
+                assert_eq!(versions.prev_log_number(), 0);
+                let new_log_number = versions.new_file_number();
+                match self
+                    .env
+                    .new_writable_file(&log_file_name(&self.dbname, new_log_number))
+                {
+                    Ok(log_file) => {
+                        let mut wal = self.wal.lock().unwrap();
+                        let log = LogWriter::new(log_file);
+                        wal.log = Some(log);
+                        wal.log_file_number = new_log_number;
+
+                        let mut imm = self.imm.write().unwrap();
+                        let mut mem = self.mem.write().unwrap();
+                        *imm = mem.take();
+                        let new_mem = MemTable::new(self.internal_comparator.clone());
+                        *mem = Some(Arc::new(new_mem));
+                        force = false; // Do not force another compaction if have room
+                        self.maybe_schedule_compaction();
+                    }
+
+                    Err(e) => {
+                        // Avoid chewing through file number space in a tight loop.
+                        versions.reuse_file_number(new_log_number);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
         Ok(versions)
+    }
+
+    fn background_compaction(&self) {
+        if self.imm.read().unwrap().is_some() {
+            self.compact_memtable();
+            return;
+        }
+
+        // TODO: major compation
+    }
+
+    fn compact_memtable(&self) {
+        if let Err(e) = self.do_compaction_memtable() {
+            self.record_back_ground_error(e);
+        }
+    }
+
+    fn do_compaction_memtable(&self) -> Result<()> {
+        let imm = self.imm.read().unwrap().as_ref().unwrap().clone();
+        let mut edit = VersionEdit::default();
+        let current = self.versions.lock().unwrap().current();
+        self.write_level0_table(imm, &mut edit, Some(current))?;
+
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(StatusError::Customize(
+                "Deleting DB during memtable compaction".to_string(),
+            ));
+        }
+
+        // Replace immutable memtable with the generated Table
+        edit.set_prev_log_number(0);
+        edit.set_log_number(self.wal.lock().unwrap().log_file_number);
+        self.versions.lock().unwrap().log_and_apply(&mut edit)?;
+
+        let mut imm = self.imm.write().unwrap();
+        *imm = None;
+        self.deleted_obsoleted_files();
+
+        Ok(())
     }
 
     fn record_back_ground_error(&self, e: StatusError) {
@@ -727,7 +872,11 @@ pub(crate) struct DBIter<E: Env> {
 }
 
 impl<E: Env> DBIter<E> {
-    pub(crate) fn new(db: Arc<DBImplInner<E>>, iter: Box<dyn Iterator>, sequence: SequenceNumber) -> Self {
+    pub(crate) fn new(
+        db: Arc<DBImplInner<E>>,
+        iter: Box<dyn Iterator>,
+        sequence: SequenceNumber,
+    ) -> Self {
         let user_comparator = db.internal_comparator.user_comparator();
         DBIter {
             db,

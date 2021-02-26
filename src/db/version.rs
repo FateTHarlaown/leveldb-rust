@@ -951,6 +951,15 @@ impl<E: Env> VersionSet<E> {
         edit.encode_to(&mut record);
         writer.add_record(record.as_slice())
     }
+
+    pub(crate) fn num_level_files(&self, level: usize) -> usize {
+        self.versions.front().unwrap().files[level].len()
+    }
+
+    pub(crate) fn need_compaction(&self) -> bool {
+        let current = self.versions.front().unwrap();
+        current.compaction_score >= 1f64 || current.file_to_compact.read().unwrap().is_some()
+    }
 }
 
 fn total_size(files: &Vec<Arc<FileMetaData>>) -> u64 {
